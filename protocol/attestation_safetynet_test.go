@@ -1,0 +1,673 @@
+package protocol
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"math/big"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/go-webauthn/webauthn/metadata"
+	"github.com/go-webauthn/webauthn/metadata/providers/memory"
+)
+
+func TestSafetyNetFormat_AttStatementErrors(t *testing.T) {
+	testCases := []struct {
+		name         string
+		attStatement map[string]any
+		err          string
+	}{
+		{
+			name:         "ShouldFailMissingVersion",
+			attStatement: map[string]any{},
+			err:          "Unable to find the version of SafetyNet",
+		},
+		{
+			name:         "ShouldFailVersionWrongType",
+			attStatement: map[string]any{stmtVersion: 123},
+			err:          "Unable to find the version of SafetyNet",
+		},
+		{
+			name:         "ShouldFailEmptyVersion",
+			attStatement: map[string]any{stmtVersion: ""},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailDottedVersion",
+			attStatement: map[string]any{stmtVersion: "2.0"},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailZeroVersion",
+			attStatement: map[string]any{stmtVersion: "0"},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailNegativeVersion",
+			attStatement: map[string]any{stmtVersion: "-1"},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailSignedVersion",
+			attStatement: map[string]any{stmtVersion: "+15180037"},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailPaddedVersion",
+			attStatement: map[string]any{stmtVersion: " 15180037"},
+			err:          "Not a proper version for SafetyNet",
+		},
+		{
+			name:         "ShouldFailMissingResponse",
+			attStatement: map[string]any{stmtVersion: "15180037"},
+			err:          "Unable to find the SafetyNet response",
+		},
+		{
+			name:         "ShouldFailResponseWrongType",
+			attStatement: map[string]any{stmtVersion: "15180037", "response": "not-bytes"},
+			err:          "Unable to find the SafetyNet response",
+		},
+		{
+			name:         "ShouldFailInvalidJWT",
+			attStatement: map[string]any{stmtVersion: "15180037", "response": []byte("!!!.a.jwt")},
+			err:          "Error verifying the SafetyNet response signature: token is malformed: could not base64 decode header: illegal base64 data at input byte 0",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			att := AttestationObject{
+				Format:       "android-safetynet",
+				AttStatement: tc.attStatement,
+			}
+
+			_, _, err := attestationFormatValidationHandlerAndroidSafetyNet(att, []byte("hash"), nil, AttestationPolicy{}, SignaturePolicy{})
+			require.EqualError(t, err, tc.err)
+		})
+	}
+}
+
+func TestSafetyNetFormat_JWTValidation(t *testing.T) {
+	caKey, caCert := safetyNetTestInstallCA(t)
+
+	key, cert := safetyNetTestGenerateKeyCert(t, "attest.android.com", caKey, caCert)
+	wrongHostKey, wrongHostCert := safetyNetTestGenerateKeyCert(t, "wrong.example.com", caKey, caCert)
+
+	// A certificate which asserts the SafetyNet hostname but chains to nothing. Before the response signing chain was
+	// verified this was accepted, allowing an attacker to attest arbitrary authenticator data.
+	forgedKey, forgedCert := safetyNetTestGenerateKeyCert(t, "attest.android.com", nil, nil)
+
+	testCases := []struct {
+		name            string
+		buildJWT        func(t *testing.T) []byte
+		rawAuthData     []byte
+		clientDataHash  []byte
+		mds             metadata.Provider
+		err             string
+		attestationType string
+	}{
+		{
+			name: "ShouldFailNonceMismatch",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString([]byte("wrong-nonce")),
+					TimestampMs:     time.Now().UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            "Invalid nonce for in SafetyNet response",
+		},
+		{
+			name: "ShouldFailCtsProfileMatchFalse",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().UnixMilli(),
+					CtsProfileMatch: false,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            "ctsProfileMatch attribute of the JWT payload is false",
+		},
+		{
+			name: "ShouldFailFutureTimestamp",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().Add(time.Hour).UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            "SafetyNet response with timestamp after current time",
+		},
+		{
+			name: "ShouldFailHostnameMismatch",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, wrongHostKey, wrongHostCert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            `Error verifying the SafetyNet response signature: token is unverifiable: error while executing keyfunc: verify x5c chain: x509: certificate is valid for wrong.example.com, not attest.android.com`,
+		},
+		{
+			name: "ShouldFailSelfSignedCertificateWithCorrectHostname",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, forgedKey, forgedCert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            `Error verifying the SafetyNet response signature: token is unverifiable: error while executing keyfunc: verify x5c chain: x509: certificate signed by unknown authority`,
+		},
+		{
+			name: "ShouldFailOldTimestampWithMDS",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().Add(-5 * time.Minute).UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			mds:            &safetyNetTestMDS{validateEntry: true},
+			err:            "SafetyNet response with timestamp before one minute ago",
+		},
+		{
+			name: "ShouldFailOldTimestampWithoutMDS",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().Add(-5 * time.Minute).UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			err:            "SafetyNet response with timestamp before one minute ago",
+		},
+		{
+			name: "ShouldPassTimestampWithinOneMinute",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().Add(-30 * time.Second).UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:     []byte("authdata"),
+			clientDataHash:  []byte("clienthash"),
+			attestationType: string(metadata.BasicFull),
+		},
+		{
+			name: "ShouldFailOldTimestampWithMDSNotValidating",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().Add(-5 * time.Minute).UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:    []byte("authdata"),
+			clientDataHash: []byte("clienthash"),
+			mds:            &safetyNetTestMDS{validateEntry: false},
+			err:            "SafetyNet response with timestamp before one minute ago",
+		},
+		{
+			name: "ShouldSucceedWithValidResponse",
+			buildJWT: func(t *testing.T) []byte {
+				t.Helper()
+
+				nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+				return safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+					Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+					TimestampMs:     time.Now().UnixMilli(),
+					CtsProfileMatch: true,
+				})
+			},
+			rawAuthData:     []byte("authdata"),
+			clientDataHash:  []byte("clienthash"),
+			attestationType: string(metadata.BasicFull),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			att := AttestationObject{
+				Format:      "android-safetynet",
+				RawAuthData: tc.rawAuthData,
+				AttStatement: map[string]any{
+					stmtVersion: "15180037",
+					"response":  tc.buildJWT(t),
+				},
+			}
+
+			attestationType, x5cs, err := attestationFormatValidationHandlerAndroidSafetyNet(att, tc.clientDataHash, tc.mds, AttestationPolicy{}, SignaturePolicy{})
+
+			if tc.err != "" {
+				require.EqualError(t, err, tc.err)
+				assert.Nil(t, x5cs)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tc.attestationType, attestationType)
+				assert.Equal(t, []any{cert}, x5cs)
+			}
+		})
+	}
+}
+
+func TestSafetyNetFormat_TrustPathMetadata(t *testing.T) {
+	caKey, caCert := safetyNetTestInstallCA(t)
+	key, cert := safetyNetTestGenerateKeyCert(t, "attest.android.com", caKey, caCert)
+
+	_, otherCert := safetyNetTestGenerateCA(t)
+
+	aaguid := uuid.MustParse("b93fd961-f2e6-462f-b122-82002247de78")
+	nonceHash := sha256.Sum256(append([]byte("authdata"), []byte("clienthash")...))
+
+	att := AttestationObject{
+		Format:      "android-safetynet",
+		RawAuthData: []byte("authdata"),
+		AttStatement: map[string]any{
+			stmtVersion: "15180037",
+			"response": safetyNetTestBuildJWT(t, key, cert, SafetyNetResponse{
+				Nonce:           base64.StdEncoding.EncodeToString(nonceHash[:]),
+				TimestampMs:     time.Now().UnixMilli(),
+				CtsProfileMatch: true,
+			}),
+		},
+	}
+
+	attestationType, x5cs, err := attestationFormatValidationHandlerAndroidSafetyNet(att, []byte("clienthash"), nil, AttestationPolicy{}, SignaturePolicy{})
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name string
+		root *x509.Certificate
+		err  string
+	}{
+		{
+			name: "ShouldAcceptTrustPathIssuedByMetadataRoot",
+			root: caCert,
+		},
+		{
+			name: "ShouldRejectTrustPathNotIssuedByMetadataRoot",
+			root: otherCert,
+			err:  "Failed to validate attestation statement signature during attestation validation for Authenticator Attestation GUID 'b93fd961-f2e6-462f-b122-82002247de78'. The attestation certificate could not be verified due to an error validating the trust chain against the Metadata Service.",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mds, err := memory.New(
+				memory.WithMetadata(map[uuid.UUID]*metadata.Entry{
+					aaguid: {
+						MetadataStatement: metadata.Statement{
+							AttestationTypes:            metadata.AuthenticatorAttestationTypes{metadata.BasicFull},
+							AttestationRootCertificates: []*x509.Certificate{tc.root},
+						},
+					},
+				}),
+				memory.WithValidateEntry(true),
+				memory.WithValidateTrustAnchor(true),
+				memory.WithValidateStatus(false),
+				memory.WithValidateAttestationTypes(true),
+			)
+			require.NoError(t, err)
+
+			actual := ValidateMetadata(context.Background(), mds, aaguid, attestationType, string(AttestationFormatAndroidSafetyNet), x5cs)
+
+			if tc.err == "" {
+				assert.Nil(t, actual)
+
+				return
+			}
+
+			require.NotNil(t, actual)
+			assert.Equal(t, tc.err, actual.Details)
+		})
+	}
+}
+
+func TestKeyFuncSafetyNetJWT(t *testing.T) {
+	caKey, caCert := safetyNetTestInstallCA(t)
+
+	_, certDER := safetyNetTestGenerateKeyCert(t, "attest.android.com", caKey, caCert)
+	_, forgedDER := safetyNetTestGenerateKeyCert(t, "attest.android.com", nil, nil)
+	_, wrongHostDER := safetyNetTestGenerateKeyCert(t, "wrong.example.com", caKey, caCert)
+
+	validB64 := base64.StdEncoding.EncodeToString(certDER)
+
+	testCases := []struct {
+		name   string
+		header map[string]any
+		err    string
+	}{
+		{
+			name:   "ShouldFailMissingX5C",
+			header: map[string]any{},
+			err:    "jwt header missing x5c",
+		},
+		{
+			name:   "ShouldFailX5CNotArray",
+			header: map[string]any{stmtX5C: "not-an-array"},
+			err:    "jwt header x5c is not a non-empty array",
+		},
+		{
+			name:   "ShouldFailX5CEmptyArray",
+			header: map[string]any{stmtX5C: []any{}},
+			err:    "jwt header x5c is not a non-empty array",
+		},
+		{
+			name:   "ShouldFailX5CFirstNotString",
+			header: map[string]any{stmtX5C: []any{123}},
+			err:    "jwt header x5c[0] is not a base64 string",
+		},
+		{
+			name:   "ShouldFailX5CFirstEmptyString",
+			header: map[string]any{stmtX5C: []any{""}},
+			err:    "jwt header x5c[0] is not a base64 string",
+		},
+		{
+			name:   "ShouldFailX5CInvalidBase64",
+			header: map[string]any{stmtX5C: []any{"not valid base64!!!"}},
+			err:    "decode x5c[0]: illegal base64 data at input byte 3",
+		},
+		{
+			name:   "ShouldFailX5CInvalidCert",
+			header: map[string]any{stmtX5C: []any{base64.StdEncoding.EncodeToString([]byte("not-a-cert"))}},
+			err:    "parse x5c[0]: x509: malformed certificate",
+		},
+		{
+			name:   "ShouldFailX5CIntermediateInvalidCert",
+			header: map[string]any{stmtX5C: []any{validB64, base64.StdEncoding.EncodeToString([]byte("not-a-cert"))}},
+			err:    "parse x5c[1]: x509: malformed certificate",
+		},
+		{
+			// The certificate asserts the SafetyNet hostname but chains to no trust anchor, so the key must not be
+			// released to verify the signature with.
+			name:   "ShouldFailSelfSignedCert",
+			header: map[string]any{stmtX5C: []any{base64.StdEncoding.EncodeToString(forgedDER)}},
+			err:    "verify x5c chain: x509: certificate signed by unknown authority",
+		},
+		{
+			name:   "ShouldFailWrongHostnameCert",
+			header: map[string]any{stmtX5C: []any{base64.StdEncoding.EncodeToString(wrongHostDER)}},
+			err:    "verify x5c chain: x509: certificate is valid for wrong.example.com, not attest.android.com",
+		},
+		{
+			name:   "ShouldSucceedWithValidCert",
+			header: map[string]any{stmtX5C: []any{validB64}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := &jwt.Token{Header: tc.header}
+
+			verifier := &safetyNetJWTVerifier{}
+
+			result, err := verifier.keyFunc(token)
+
+			if tc.err != "" {
+				assert.Nil(t, result)
+				assert.Nil(t, verifier.x5c)
+				assert.Nil(t, verifier.certs)
+				require.EqualError(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				assert.NotNil(t, result)
+				assert.Len(t, verifier.certs, 1)
+			}
+		})
+	}
+}
+
+// TestKeyFuncSafetyNetJWTSystemRoots asserts that a nil pool falls back to the host trust store rather than trusting
+// anything, as an empty pool and a nil pool must not behave the same way.
+func TestKeyFuncSafetyNetJWTSystemRoots(t *testing.T) {
+	original := attStatementAndroidSafetyNetRootsCertPool
+	attStatementAndroidSafetyNetRootsCertPool = nil
+
+	t.Cleanup(func() {
+		attStatementAndroidSafetyNetRootsCertPool = original
+	})
+
+	_, forgedDER := safetyNetTestGenerateKeyCert(t, "attest.android.com", nil, nil)
+
+	verifier := &safetyNetJWTVerifier{}
+
+	result, err := verifier.keyFunc(&jwt.Token{
+		Header: map[string]any{stmtX5C: []any{base64.StdEncoding.EncodeToString(forgedDER)}},
+	})
+
+	assert.Nil(t, result)
+	require.EqualError(t, err, "verify x5c chain: x509: certificate signed by unknown authority")
+}
+
+func TestSafetyNetFormat_ParseExistingResponse(t *testing.T) {
+	successParsed := attestationTestUnpackResponse(t, safetyNetTestResponse["success"])
+
+	assert.Equal(t, "android-safetynet", successParsed.Response.AttestationObject.Format)
+	require.NotEmpty(t, successParsed.Response.AttestationObject.AttStatement)
+
+	version, ok := successParsed.Response.AttestationObject.AttStatement[stmtVersion].(string)
+	require.True(t, ok)
+	assert.Equal(t, "15180037", version)
+
+	_, ok = successParsed.Response.AttestationObject.AttStatement["response"].([]byte)
+	assert.True(t, ok)
+}
+
+// Supporting functions and test data.
+
+// safetyNetTestInstallCA creates a certificate authority for issuing SafetyNet response signing certificates and
+// installs it as the trust anchor for the duration of the test.
+func safetyNetTestInstallCA(t *testing.T) (*rsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+
+	key, cert := safetyNetTestGenerateCA(t)
+
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+
+	original := attStatementAndroidSafetyNetRootsCertPool
+	attStatementAndroidSafetyNetRootsCertPool = pool
+
+	t.Cleanup(func() {
+		attStatementAndroidSafetyNetRootsCertPool = original
+	})
+
+	return key, cert
+}
+
+// safetyNetTestGenerateCA creates a certificate authority for issuing SafetyNet response signing certificates.
+func safetyNetTestGenerateCA(t *testing.T) (*rsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "SafetyNet Test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	cert, err := x509.ParseCertificate(der)
+	require.NoError(t, err)
+
+	return key, cert
+}
+
+func safetyNetTestGenerateKeyCert(t *testing.T, hostname string, caKey *rsa.PrivateKey, caCert *x509.Certificate) (*rsa.PrivateKey, []byte) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: hostname},
+		DNSNames:     []string{hostname},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	parent, signer := caCert, caKey
+
+	if caKey == nil {
+		parent, signer = template, key
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, signer)
+	require.NoError(t, err)
+
+	return key, der
+}
+
+type safetyNetTestMDS struct {
+	metadata.Provider
+	validateEntry bool
+}
+
+func (m *safetyNetTestMDS) GetValidateEntry(_ context.Context) bool {
+	return m.validateEntry
+}
+
+func safetyNetTestBuildJWT(t *testing.T, key *rsa.PrivateKey, certDER []byte, response SafetyNetResponse) []byte {
+	t.Helper()
+
+	certB64 := base64.StdEncoding.EncodeToString(certDER)
+
+	token := jwt.New(jwt.SigningMethodRS256)
+	token.Header[stmtX5C] = []any{certB64}
+
+	claims := jwt.MapClaims{
+		"nonce":           response.Nonce,
+		"timestampMs":     float64(response.TimestampMs),
+		"ctsProfileMatch": response.CtsProfileMatch,
+	}
+
+	token.Claims = claims
+
+	signed, err := token.SignedString(key)
+	require.NoError(t, err)
+
+	return []byte(signed)
+}
+
+//nolint:unused
+var safetyNetTestRequest = map[string]string{
+	`success`: `{
+		"publicKey": {
+		  "challenge": "dfo+HlqJp3MLK+J5TLxxmvXJieS3zGwdk9G9H9bPezg=",
+		  "rp": {
+			"name": "webauthn.io",
+			"id": "webauthn.io"
+		  },
+		  "user": {
+			"name": "safetynetter",
+			"displayName": "safetynetter",
+			"id": "wDkAAAAAAAAAAA=="
+		  },
+		  "pubKeyCredParams": [
+			{ "type": "public-key", "alg": -7 },
+			{ "type": "public-key", "alg": -35 },
+			{ "type": "public-key", "alg": -36 },
+			{ "type": "public-key", "alg": -65535 },
+			{ "type": "public-key", "alg": -257 },
+			{ "type": "public-key", "alg": -258 },
+			{ "type": "public-key", "alg": -259 },
+			{ "type": "public-key", "alg": -37 },
+			{ "type": "public-key", "alg": -38 },
+			{ "type": "public-key", "alg": -39 },
+			{ "type": "public-key", "alg": -8 }
+		  ],
+		  "authenticatorSelection": {
+			"authenticatorAttachment": "platform",
+			"userVerification": "preferred"
+		  },
+		  "timeout": 60000,
+		  "attestation": "direct"
+		}
+	  }`,
+}
+
+var safetyNetTestResponse = map[string]string{
+	`success`: `{
+		"id":"AUiVU3Mk3uJomfHcJcu6ScwUHRysE2e6IgaTNAzQ34TP0OPifi2LgGD_5hzxRhOfQTB1fW6k63C8tk-MwywpNVI",
+		"rawId":"AUiVU3Mk3uJomfHcJcu6ScwUHRysE2e6IgaTNAzQ34TP0OPifi2LgGD_5hzxRhOfQTB1fW6k63C8tk-MwywpNVI",
+		"type":"public-key",
+		"response":{
+			"attestationObject":"o2NmbXRxYW5kcm9pZC1zYWZldHluZXRnYXR0U3RtdKJjdmVyaDE1MTgwMDM3aHJlc3BvbnNlWRS9ZXlKaGJHY2lPaUpTVXpJMU5pSXNJbmcxWXlJNld5Sk5TVWxHYTJwRFEwSkljV2RCZDBsQ1FXZEpVVkpZY205T01GcFBaRkpyUWtGQlFVRkJRVkIxYm5wQlRrSm5hM0ZvYTJsSE9YY3dRa0ZSYzBaQlJFSkRUVkZ6ZDBOUldVUldVVkZIUlhkS1ZsVjZSV1ZOUW5kSFFURlZSVU5vVFZaU01qbDJXako0YkVsR1VubGtXRTR3U1VaT2JHTnVXbkJaTWxaNlRWSk5kMFZSV1VSV1VWRkVSWGR3U0ZaR1RXZFJNRVZuVFZVNGVFMUNORmhFVkVVMFRWUkJlRTFFUVROTlZHc3dUbFp2V0VSVVJUVk5WRUYzVDFSQk0wMVVhekJPVm05M1lrUkZURTFCYTBkQk1WVkZRbWhOUTFaV1RYaEZla0ZTUW1kT1ZrSkJaMVJEYTA1b1lrZHNiV0l6U25WaFYwVjRSbXBCVlVKblRsWkNRV05VUkZVeGRtUlhOVEJaVjJ4MVNVWmFjRnBZWTNoRmVrRlNRbWRPVmtKQmIxUkRhMlIyWWpKa2MxcFRRazFVUlUxNFIzcEJXa0puVGxaQ1FVMVVSVzFHTUdSSFZucGtRelZvWW0xU2VXSXliR3RNYlU1MllsUkRRMEZUU1hkRVVWbEtTMjlhU1doMlkwNUJVVVZDUWxGQlJHZG5SVkJCUkVORFFWRnZRMmRuUlVKQlRtcFlhM293WlVzeFUwVTBiU3N2UnpWM1QyOHJXRWRUUlVOeWNXUnVPRGh6UTNCU04yWnpNVFJtU3pCU2FETmFRMWxhVEVaSWNVSnJOa0Z0V2xaM01rczVSa2N3VHpseVVsQmxVVVJKVmxKNVJUTXdVWFZ1VXpsMVowaEROR1ZuT1c5MmRrOXRLMUZrV2pKd09UTllhSHAxYmxGRmFGVlhXRU40UVVSSlJVZEtTek5UTW1GQlpucGxPVGxRVEZNeU9XaE1ZMUYxV1ZoSVJHRkROMDlhY1U1dWIzTnBUMGRwWm5NNGRqRnFhVFpJTDNob2JIUkRXbVV5YkVvck4wZDFkSHBsZUV0d2VIWndSUzkwV2xObVlsazVNRFZ4VTJ4Q2FEbG1jR293TVRWamFtNVJSbXRWYzBGVmQyMUxWa0ZWZFdWVmVqUjBTMk5HU3pSd1pYWk9UR0Y0UlVGc0swOXJhV3hOZEVsWlJHRmpSRFZ1Wld3MGVFcHBlWE0wTVROb1lXZHhWekJYYUdnMVJsQXpPV2hIYXpsRkwwSjNVVlJxWVhwVGVFZGtkbGd3YlRaNFJsbG9hQzh5VmsxNVdtcFVORXQ2VUVwRlEwRjNSVUZCWVU5RFFXeG5kMmRuU2xWTlFUUkhRVEZWWkVSM1JVSXZkMUZGUVhkSlJtOUVRVlJDWjA1V1NGTlZSVVJFUVV0Q1oyZHlRbWRGUmtKUlkwUkJWRUZOUW1kT1ZraFNUVUpCWmpoRlFXcEJRVTFDTUVkQk1WVmtSR2RSVjBKQ1VYRkNVWGRIVjI5S1FtRXhiMVJMY1hWd2J6UlhObmhVTm1veVJFRm1RbWRPVmtoVFRVVkhSRUZYWjBKVFdUQm1hSFZGVDNaUWJTdDRaMjU0YVZGSE5rUnlabEZ1T1V0NlFtdENaMmR5UW1kRlJrSlJZMEpCVVZKWlRVWlpkMHAzV1VsTGQxbENRbEZWU0UxQlIwZEhNbWd3WkVoQk5reDVPWFpaTTA1M1RHNUNjbUZUTlc1aU1qbHVUREprTUdONlJuWk5SRUZ5UW1kbmNrSm5SVVpDVVdOM1FXOVpabUZJVWpCalJHOTJURE5DY21GVE5XNWlNamx1VERKa2VtTnFTWFpTTVZKVVRWVTRlRXh0VG5sa1JFRmtRbWRPVmtoU1JVVkdha0ZWWjJoS2FHUklVbXhqTTFGMVdWYzFhMk50T1hCYVF6VnFZakl3ZDBsUldVUldVakJuUWtKdmQwZEVRVWxDWjFwdVoxRjNRa0ZuU1hkRVFWbExTM2RaUWtKQlNGZGxVVWxHUVhwQmRrSm5UbFpJVWpoRlMwUkJiVTFEVTJkSmNVRm5hR2cxYjJSSVVuZFBhVGgyV1ROS2MweHVRbkpoVXpWdVlqSTVia3d3WkZWVmVrWlFUVk0xYW1OdGQzZG5aMFZGUW1kdmNrSm5SVVZCWkZvMVFXZFJRMEpKU0RGQ1NVaDVRVkJCUVdSM1EydDFVVzFSZEVKb1dVWkpaVGRGTmt4TldqTkJTMUJFVjFsQ1VHdGlNemRxYW1RNE1FOTVRVE5qUlVGQlFVRlhXbVJFTTFCTVFVRkJSVUYzUWtsTlJWbERTVkZEVTFwRFYyVk1Tblp6YVZaWE5rTm5LMmRxTHpsM1dWUktVbnAxTkVocGNXVTBaVmswWXk5dGVYcHFaMGxvUVV4VFlta3ZWR2g2WTNweGRHbHFNMlJyTTNaaVRHTkpWek5NYkRKQ01HODNOVWRSWkdoTmFXZGlRbWRCU0ZWQlZtaFJSMjFwTDFoM2RYcFVPV1ZIT1ZKTVNTdDRNRm95ZFdKNVdrVldla0UzTlZOWlZtUmhTakJPTUVGQlFVWnRXRkU1ZWpWQlFVRkNRVTFCVW1wQ1JVRnBRbU5EZDBFNWFqZE9WRWRZVURJM09IbzBhSEl2ZFVOSWFVRkdUSGx2UTNFeVN6QXJlVXhTZDBwVlltZEpaMlk0WjBocWRuQjNNbTFDTVVWVGFuRXlUMll6UVRCQlJVRjNRMnR1UTJGRlMwWlZlVm8zWmk5UmRFbDNSRkZaU2t0dldrbG9kbU5PUVZGRlRFSlJRVVJuWjBWQ1FVazVibFJtVWt0SlYyZDBiRmRzTTNkQ1REVTFSVlJXTm10aGVuTndhRmN4ZVVGak5VUjFiVFpZVHpReGExcDZkMG8yTVhkS2JXUlNVbFF2VlhORFNYa3hTMFYwTW1Nd1JXcG5iRzVLUTBZeVpXRjNZMFZYYkV4UldWSllVRXg1Um1wclYxRk9ZbE5vUWpGcE5GY3lUbEpIZWxCb2RETnRNV0kwT1doaWMzUjFXRTAyZEZnMVEzbEZTRzVVYURoQ2IyMDBMMWRzUm1sb2VtaG5iamd4Ukd4a2IyZDZMMHN5VlhkTk5sTTJRMEl2VTBWNGEybFdabllyZW1KS01ISnFkbWM1TkVGc1pHcFZabFYzYTBrNVZrNU5ha1ZRTldVNGVXUkNNMjlNYkRabmJIQkRaVVkxWkdkbVUxZzBWVGw0TXpWdmFpOUpTV1F6VlVVdlpGQndZaTl4WjBkMmMydG1aR1Y2ZEcxVmRHVXZTMU50Y21sM1kyZFZWMWRsV0daVVlra3plbk5wYTNkYVltdHdiVkpaUzIxcVVHMW9kalJ5YkdsNlIwTkhkRGhRYmpod2NUaE5Na3RFWmk5UU0ydFdiM1F6WlRFNFVUMGlMQ0pOU1VsRlUycERRMEY2UzJkQmQwbENRV2RKVGtGbFR6QnRjVWRPYVhGdFFrcFhiRkYxUkVGT1FtZHJjV2hyYVVjNWR6QkNRVkZ6UmtGRVFrMU5VMEYzU0dkWlJGWlJVVXhGZUdSSVlrYzVhVmxYZUZSaFYyUjFTVVpLZG1JelVXZFJNRVZuVEZOQ1UwMXFSVlJOUWtWSFFURlZSVU5vVFV0U01uaDJXVzFHYzFVeWJHNWlha1ZVVFVKRlIwRXhWVVZCZUUxTFVqSjRkbGx0Um5OVk1teHVZbXBCWlVaM01IaE9la0V5VFZSVmQwMUVRWGRPUkVwaFJuY3dlVTFVUlhsTlZGVjNUVVJCZDA1RVNtRk5SVWw0UTNwQlNrSm5UbFpDUVZsVVFXeFdWRTFTTkhkSVFWbEVWbEZSUzBWNFZraGlNamx1WWtkVloxWklTakZqTTFGblZUSldlV1J0YkdwYVdFMTRSWHBCVWtKblRsWkNRVTFVUTJ0a1ZWVjVRa1JSVTBGNFZIcEZkMmRuUldsTlFUQkhRMU54UjFOSllqTkVVVVZDUVZGVlFVRTBTVUpFZDBGM1oyZEZTMEZ2U1VKQlVVUlJSMDA1UmpGSmRrNHdOWHByVVU4NUszUk9NWEJKVW5aS2VucDVUMVJJVnpWRWVrVmFhRVF5WlZCRGJuWlZRVEJSYXpJNFJtZEpRMlpMY1VNNVJXdHpRelJVTW1aWFFsbHJMMnBEWmtNelVqTldXazFrVXk5a1RqUmFTME5GVUZwU2NrRjZSSE5wUzFWRWVsSnliVUpDU2pWM2RXUm5lbTVrU1UxWlkweGxMMUpIUjBac05YbFBSRWxMWjJwRmRpOVRTa2d2VlV3clpFVmhiSFJPTVRGQ2JYTkxLMlZSYlUxR0t5dEJZM2hIVG1oeU5UbHhUUzg1YVd3M01Va3laRTQ0UmtkbVkyUmtkM1ZoWldvMFlsaG9jREJNWTFGQ1ltcDRUV05KTjBwUU1HRk5NMVEwU1N0RWMyRjRiVXRHYzJKcWVtRlVUa001ZFhwd1JteG5UMGxuTjNKU01qVjRiM2x1VlhoMk9IWk9iV3R4TjNwa1VFZElXR3Q0VjFrM2IwYzVhaXRLYTFKNVFrRkNhemRZY2twbWIzVmpRbHBGY1VaS1NsTlFhemRZUVRCTVMxY3dXVE42Tlc5Nk1rUXdZekYwU2t0M1NFRm5UVUpCUVVkcVoyZEZlazFKU1VKTWVrRlBRbWRPVmtoUk9FSkJaamhGUWtGTlEwRlpXWGRJVVZsRVZsSXdiRUpDV1hkR1FWbEpTM2RaUWtKUlZVaEJkMFZIUTBOelIwRlJWVVpDZDAxRFRVSkpSMEV4VldSRmQwVkNMM2RSU1UxQldVSkJaamhEUVZGQmQwaFJXVVJXVWpCUFFrSlpSVVpLYWxJclJ6UlJOamdyWWpkSFEyWkhTa0ZpYjA5ME9VTm1NSEpOUWpoSFFURlZaRWwzVVZsTlFtRkJSa3AyYVVJeFpHNUlRamRCWVdkaVpWZGlVMkZNWkM5alIxbFpkVTFFVlVkRFEzTkhRVkZWUmtKM1JVSkNRMnQzU25wQmJFSm5aM0pDWjBWR1FsRmpkMEZaV1ZwaFNGSXdZMFJ2ZGt3eU9XcGpNMEYxWTBkMGNFeHRaSFppTW1OMldqTk9lVTFxUVhsQ1owNVdTRkk0UlV0NlFYQk5RMlZuU21GQmFtaHBSbTlrU0ZKM1QyazRkbGt6U25OTWJrSnlZVk0xYm1JeU9XNU1NbVI2WTJwSmRsb3pUbmxOYVRWcVkyMTNkMUIzV1VSV1VqQm5Ra1JuZDA1cVFUQkNaMXB1WjFGM1FrRm5TWGRMYWtGdlFtZG5ja0puUlVaQ1VXTkRRVkpaWTJGSVVqQmpTRTAyVEhrNWQyRXlhM1ZhTWpsMlduazVlVnBZUW5aak1td3dZak5LTlV4NlFVNUNaMnR4YUd0cFJ6bDNNRUpCVVhOR1FVRlBRMEZSUlVGSGIwRXJUbTV1TnpoNU5uQlNhbVE1V0d4UlYwNWhOMGhVWjJsYUwzSXpVazVIYTIxVmJWbElVRkZ4TmxOamRHazVVRVZoYW5aM1VsUXlhVmRVU0ZGeU1ESm1aWE54VDNGQ1dUSkZWRlYzWjFwUksyeHNkRzlPUm5ab2MwODVkSFpDUTA5SllYcHdjM2RYUXpsaFNqbDRhblUwZEZkRVVVZzRUbFpWTmxsYVdpOVlkR1ZFVTBkVk9WbDZTbkZRYWxrNGNUTk5SSGh5ZW0xeFpYQkNRMlkxYnpodGR5OTNTalJoTWtjMmVIcFZjalpHWWpaVU9FMWpSRTh5TWxCTVVrdzJkVE5OTkZSNmN6TkJNazB4YWpaaWVXdEtXV2s0ZDFkSlVtUkJka3RNVjFwMUwyRjRRbFppZWxsdGNXMTNhMjAxZWt4VFJGYzFia2xCU21KRlRFTlJRMXAzVFVnMU5uUXlSSFp4YjJaNGN6WkNRbU5EUmtsYVZWTndlSFUyZURaMFpEQldOMU4yU2tORGIzTnBjbE50U1dGMGFpODVaRk5UVmtSUmFXSmxkRGh4THpkVlN6UjJORnBWVGpnd1lYUnVXbm94ZVdjOVBTSmRmUS5leUp1YjI1alpTSTZJazlGTDJkV09FYzRXazFKTW1ORUsyRk1lRzB2VGt4a1dVMHdjemxsVDB0V1NYUlhOblZTVDI5d1prRTlJaXdpZEdsdFpYTjBZVzF3VFhNaU9qRTFOVE13TWpnd05ETTFNamtzSW1Gd2ExQmhZMnRoWjJWT1lXMWxJam9pWTI5dExtZHZiMmRzWlM1aGJtUnliMmxrTG1kdGN5SXNJbUZ3YTBScFoyVnpkRk5vWVRJMU5pSTZJbGRVYkd4aVVuVXhZbFEyYlZoeWRXRmlXVWQ1WmtvMFJGUTVVR1I0YnpGUFMwb3ZWRTQzTVZWU1lXODlJaXdpWTNSelVISnZabWxzWlUxaGRHTm9JanAwY25WbExDSmhjR3REWlhKMGFXWnBZMkYwWlVScFoyVnpkRk5vWVRJMU5pSTZXeUk0VURGelZ6QkZVRXBqYzJ4M04xVjZVbk5wV0V3Mk5IY3JUelV3UldRclVrSkpRM1JoZVRGbk1qUk5QU0pkTENKaVlYTnBZMGx1ZEdWbmNtbDBlU0k2ZEhKMVpYMC56V3ViaWlraGt5alhETUJpV080ajZEdnVBZWdpSUh1WGhaNWQtTEh3Z1VBZFVSMWxNTU0tZ0Y4VklmSEdYcFZNZ1hhN3plR0l5NEROU19uNTdBZ2c0eE5lTVhQMHRpMVJ4QktVVlJKeUc1OXVoejJJbDBtZkl1UVZNckRpSHBiWjdYb2tKcG1jZlUyWU9QbmppcjlWUjlsVlRZUHVHV1phT01ua1kyRnlvbTRGZzhrNFA3dEtWWllzTXNERWR3ZVdOdTM5MS1mcXdKWUxQUWNjQ0ZiNURCRWc0SlMwa05pWG8zLWc3MTFWVGd2Z284WDMyMS03NWw5MnN6UWpDeDQ3aDFzY243ZmE1TkJhTkdfanVPZjV0QnhFbl9uY3N1TjR3RVRnT0JJVHFVN0xZWmxTVEtUX2lYODFncUJOOWtuWGMtQ0NVZUh1LThvLUdmekh1Y1BsSEFoYXV0aERhdGFYxXSm6pITyZwvdLIkkrMgz0AmKpTBqVCgOX8pJQtghB7wRQAAAAC5P9lh8uZGL7EiggAiR954AEEBSJVTcyTe4miZ8dwly7pJzBQdHKwTZ7oiBpM0DNDfhM_Q4-J-LYuAYP_mHPFGE59BMHV9bqTrcLy2T4zDLCk1UqUBAgMmIAEhWCC0eleNTLgwWxaVBqV139T6hONseRz7HgXRIVS9bPxIjSJYIJ1MfwUhvkSEjeiNJ6y5-w8PuuwMAvfgpN7F4Q2EW79v",
+			"clientDataJSON":"eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiZGZvLUhscUpwM01MSy1KNVRMeHhtdlhKaWVTM3pHd2RrOUc5SDliUGV6ZyIsIm9yaWdpbiI6Imh0dHBzOlwvXC93ZWJhdXRobi5pbyIsImFuZHJvaWRQYWNrYWdlTmFtZSI6ImNvbS5hbmRyb2lkLmNocm9tZSJ9"
+		}
+	}`,
+}

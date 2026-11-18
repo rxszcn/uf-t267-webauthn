@@ -1,0 +1,1880 @@
+package webauthn
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/go-webauthn/webauthn/metadata"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/protocol/webauthncose"
+	"github.com/go-webauthn/webauthn/testing/mocks"
+)
+
+func TestWithRegistrationRelyingPartyID(t *testing.T) {
+	testCases := []struct {
+		name         string
+		have         *Config
+		opts         []RegistrationOption
+		expectedID   string
+		expectedName string
+		err          string
+	}{
+		{
+			name: "OptionDefinedInConfig",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts:         nil,
+			expectedID:   "example.com",
+			expectedName: "Test Display Name",
+		},
+		{
+			name: "OptionDefinedInConfigAndOpts",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts:         []RegistrationOption{WithRegistrationRelyingPartyID("a.example.com"), WithRegistrationRelyingPartyName("Test Display Name2")},
+			expectedID:   "a.example.com",
+			expectedName: "Test Display Name2",
+		},
+		{
+			name: "OptionDefinedInConfigWithNoErrAndInOptsWithError",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts: []RegistrationOption{WithRegistrationRelyingPartyID("---::~!!~@#M!@OIK#N!@IOK@@@@@@@@@@"), WithRegistrationRelyingPartyName("Test Display Name2")},
+			err:  "error generating credential creation: the relying party id failed to validate as it's not a valid domain string with error: parse \"---::~!!~@\": first path segment in URL cannot contain colon",
+		},
+		{
+			name: "OptionDefinedInOpts",
+			have: &Config{
+				RPOrigins: []string{"example.com"},
+			},
+			opts:         []RegistrationOption{WithRegistrationRelyingPartyID("example.com"), WithRegistrationRelyingPartyName("Test Display Name")},
+			expectedID:   "example.com",
+			expectedName: "Test Display Name",
+		},
+		{
+			name: "OptionDisplayNameNotDefined",
+			have: &Config{
+				RPOrigins: []string{"https://example.com"},
+			},
+			opts: []RegistrationOption{WithRegistrationRelyingPartyID("example.com")},
+			err:  "error generating credential creation: the relying party display name must be provided via the configuration or a functional option for a creation",
+		},
+		{
+			name: "OptionIDNotDefined",
+			have: &Config{
+				RPOrigins: []string{"https://example.com"},
+			},
+			opts: []RegistrationOption{WithRegistrationRelyingPartyName("Test Display Name")},
+			err:  "error generating credential creation: the relying party id must be provided via the configuration or a functional option for a creation",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.have)
+			assert.NoError(t, err)
+
+			user := &defaultUser{id: []byte(testUserID)}
+
+			creation, _, err := w.BeginRegistration(user, tc.opts...)
+			if tc.err != "" {
+				assert.EqualError(t, err, tc.err)
+			} else {
+				assert.NoError(t, err)
+				require.NotNil(t, creation)
+				assert.Equal(t, tc.expectedID, creation.Response.RelyingParty.ID)
+				assert.Equal(t, tc.expectedName, creation.Response.RelyingParty.Name)
+			}
+		})
+	}
+}
+
+func TestRegistration_FinishRegistrationFailure(t *testing.T) {
+	user := &defaultUser{
+		id: []byte("123"),
+	}
+
+	session := SessionData{
+		UserID: []byte("ABC"),
+	}
+
+	webauthn := &WebAuthn{}
+
+	credential, err := webauthn.FinishRegistration(user, session, nil)
+	if err == nil {
+		t.Errorf("FinishRegistration() error = nil, want %v", protocol.ErrBadRequest.Type)
+	}
+
+	if credential != nil {
+		t.Errorf("FinishRegistration() credential = %v, want nil", credential)
+	}
+}
+
+func TestEntityEncoding(t *testing.T) {
+	testCases := []struct {
+		name           string
+		b64            bool
+		have, expected string
+	}{
+		{"ShouldEncodeBase64", true, "abc", `{"name":"","displayName":"","id":"YWJj"}`},
+		{"ShouldEncodeString", false, "abc", `{"name":"","displayName":"","id":"abc"}`},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			entityUser := protocol.UserEntity{}
+
+			if tc.b64 {
+				entityUser.ID = protocol.URLEncodedBase64(tc.have)
+			} else {
+				entityUser.ID = tc.have
+			}
+
+			data, err := json.Marshal(entityUser)
+
+			assert.NoError(t, err)
+
+			assert.Equal(t, tc.expected, string(data))
+		})
+	}
+}
+
+func TestCreateCredential_Errors(t *testing.T) {
+	testCases := []struct {
+		name    string
+		user    User
+		session SessionData
+		err     string
+	}{
+		{
+			name: "ShouldFailUserIDMismatch",
+			user: &defaultUser{
+				id: []byte("123"),
+			},
+			session: SessionData{
+				UserID: []byte("456"),
+			},
+			err: "ID mismatch for User and Session",
+		},
+		{
+			name: "ShouldFailSessionExpired",
+			user: &defaultUser{
+				id: []byte("123"),
+			},
+			session: SessionData{
+				UserID:  []byte("123"),
+				Expires: time.Now().Add(-time.Hour),
+			},
+			err: "Session has Expired",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &WebAuthn{Config: &Config{
+				RPID:      "example.com",
+				RPOrigins: []string{"https://example.com"},
+			}}
+
+			credential, err := w.CreateCredential(tc.user, tc.session, nil)
+			assert.Nil(t, credential)
+			assert.EqualError(t, err, tc.err)
+		})
+	}
+}
+
+func TestBeginRegistration_Timeouts(t *testing.T) {
+	testCases := []struct {
+		name            string
+		config          *Config
+		opts            []RegistrationOption
+		expectedTimeout int
+	}{
+		{
+			name: "ShouldUseDefaultTimeout",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			expectedTimeout: 300000,
+		},
+		{
+			name: "ShouldUseUVDTimeout",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					UserVerification: protocol.VerificationDiscouraged,
+				},
+			},
+			expectedTimeout: 120000,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.config)
+			require.NoError(t, err)
+
+			user := &defaultUser{id: []byte("123")}
+
+			creation, _, err := w.BeginRegistration(user, tc.opts...)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedTimeout, creation.Response.Timeout)
+		})
+	}
+}
+
+func TestBeginRegistration_EncodeUserIDAsString(t *testing.T) {
+	testCases := []struct {
+		name           string
+		encodeAsString bool
+		userID         string
+		expectedIDType string
+	}{
+		{
+			name:           "ShouldEncodeAsBase64",
+			encodeAsString: false,
+			userID:         "testuser",
+			expectedIDType: "protocol.URLEncodedBase64",
+		},
+		{
+			name:           "ShouldEncodeAsString",
+			encodeAsString: true,
+			userID:         "testuser",
+			expectedIDType: "string",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &Config{
+				RPID:                 "example.com",
+				RPDisplayName:        "Test Display Name",
+				RPOrigins:            []string{"https://example.com"},
+				EncodeUserIDAsString: tc.encodeAsString,
+			}
+
+			w, err := New(config)
+			require.NoError(t, err)
+
+			user := &defaultUser{id: []byte(tc.userID)}
+
+			creation, _, err := w.BeginRegistration(user)
+			require.NoError(t, err)
+
+			if tc.encodeAsString {
+				_, ok := creation.Response.User.ID.(string)
+				assert.True(t, ok)
+			} else {
+				_, ok := creation.Response.User.ID.(protocol.URLEncodedBase64)
+				assert.True(t, ok)
+			}
+		})
+	}
+}
+
+func TestBeginMediatedRegistration_ChallengeLength(t *testing.T) {
+	// withTestChallenge is a test-only RegistrationOption that overrides the generated challenge. It mirrors the
+	// WithChallenge login option; no equivalent is exported for registration, so we synthesise one here to exercise
+	// the minimum-length guard.
+	withTestChallenge := func(challenge []byte) RegistrationOption {
+		return func(cco *protocol.PublicKeyCredentialCreationOptions) error {
+			cco.Challenge = challenge
+
+			return nil
+		}
+	}
+
+	config := &Config{
+		RPID:          "example.com",
+		RPDisplayName: "Test Display Name",
+		RPOrigins:     []string{"https://example.com"},
+	}
+
+	testCases := []struct {
+		name   string
+		opts   []RegistrationOption
+		expLen int
+		err    string
+	}{
+		{
+			name:   "ShouldSucceedWithDefaultChallenge",
+			opts:   nil,
+			expLen: 32,
+		},
+		{
+			name: "ShouldFailNilChallenge",
+			opts: []RegistrationOption{withTestChallenge(nil)},
+			err:  "error generating credential creation: the challenge must be at least 16 bytes",
+		},
+		{
+			name: "ShouldFailEmptyChallenge",
+			opts: []RegistrationOption{withTestChallenge([]byte{})},
+			err:  "error generating credential creation: the challenge must be at least 16 bytes",
+		},
+		{
+			name: "ShouldFailEightByteChallenge",
+			opts: []RegistrationOption{withTestChallenge(bytes.Repeat([]byte{0xab}, 8))},
+			err:  "error generating credential creation: the challenge must be at least 16 bytes",
+		},
+		{
+			name: "ShouldFailFifteenByteChallenge",
+			opts: []RegistrationOption{withTestChallenge(bytes.Repeat([]byte{0xab}, 15))},
+			err:  "error generating credential creation: the challenge must be at least 16 bytes",
+		},
+		{
+			name:   "ShouldSucceedSixteenByteChallenge",
+			opts:   []RegistrationOption{withTestChallenge(bytes.Repeat([]byte{0xab}, 16))},
+			expLen: 16,
+		},
+		{
+			name:   "ShouldSucceedThirtyTwoByteChallenge",
+			opts:   []RegistrationOption{withTestChallenge(bytes.Repeat([]byte{0xab}, 32))},
+			expLen: 32,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(config)
+			require.NoError(t, err)
+
+			user := &defaultUser{id: []byte("123")}
+
+			creation, session, err := w.BeginMediatedRegistration(user, protocol.MediationDefault, tc.opts...)
+
+			if tc.err != "" {
+				assert.EqualError(t, err, tc.err)
+				assert.Nil(t, creation)
+				assert.Nil(t, session)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, creation)
+			require.NotNil(t, session)
+			assert.Len(t, []byte(creation.Response.Challenge), tc.expLen)
+			assert.NotEmpty(t, session.Challenge)
+			assert.Equal(t, creation.Response.Challenge.String(), session.Challenge)
+		})
+	}
+}
+
+func TestBeginMediatedRegistration_EnforceTimeout(t *testing.T) {
+	config := &Config{
+		RPID:          "example.com",
+		RPDisplayName: "Test Display Name",
+		RPOrigins:     []string{"https://example.com"},
+		Timeouts: TimeoutsConfig{
+			Registration: TimeoutConfig{
+				Enforce: true,
+				Timeout: time.Second * 60,
+			},
+		},
+	}
+
+	w, err := New(config)
+	require.NoError(t, err)
+
+	user := &defaultUser{id: []byte("123")}
+
+	_, session, err := w.BeginMediatedRegistration(user, protocol.MediationConditional)
+	require.NoError(t, err)
+	assert.False(t, session.Expires.IsZero())
+	assert.Equal(t, protocol.MediationConditional, session.Mediation)
+}
+
+func TestRegistrationOptions(t *testing.T) {
+	tv := true
+	fv := false
+
+	testCases := []struct {
+		name     string
+		opts     []RegistrationOption
+		have     protocol.PublicKeyCredentialCreationOptions
+		expected protocol.PublicKeyCredentialCreationOptions
+	}{
+		{
+			name: "Empty",
+			opts: nil,
+		},
+		{
+			name: "CredentialParametersDefault",
+			opts: []RegistrationOption{WithCredentialParameters(CredentialParametersDefault())},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Parameters: CredentialParametersDefault(),
+			},
+		},
+		{
+			name: "CredentialParametersL3Extended",
+			opts: []RegistrationOption{WithCredentialParameters(CredentialParametersExtendedL3())},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Parameters: CredentialParametersExtendedL3(),
+			},
+		},
+		{
+			name: "CredentialParametersL3Recommended",
+			opts: []RegistrationOption{WithCredentialParameters(CredentialParametersRecommendedL3())},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Parameters: CredentialParametersRecommendedL3(),
+			},
+		},
+		{
+			name: "Exclusions",
+			opts: []RegistrationOption{WithExclusions([]protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123"), Transport: []protocol.AuthenticatorTransport{protocol.Hybrid}}})},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				CredentialExcludeList: []protocol.CredentialDescriptor{
+					{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123"), Transport: []protocol.AuthenticatorTransport{protocol.Hybrid}},
+				},
+			},
+		},
+		{
+			name: "Selections",
+			opts: []RegistrationOption{WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+				AuthenticatorAttachment: protocol.CrossPlatform,
+				RequireResidentKey:      &tv,
+				ResidentKey:             protocol.ResidentKeyRequirementRequired,
+				UserVerification:        protocol.VerificationRequired,
+			})},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					AuthenticatorAttachment: protocol.CrossPlatform,
+					RequireResidentKey:      &tv,
+					ResidentKey:             protocol.ResidentKeyRequirementRequired,
+					UserVerification:        protocol.VerificationRequired,
+				},
+			},
+		},
+		{
+			name: "ResidentKeyRequirementRequired",
+			opts: []RegistrationOption{WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired)},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					RequireResidentKey: &tv,
+					ResidentKey:        protocol.ResidentKeyRequirementRequired,
+				},
+			},
+		},
+		{
+			name: "ResidentKeyRequirementPreferred",
+			opts: []RegistrationOption{WithResidentKeyRequirement(protocol.ResidentKeyRequirementPreferred)},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					RequireResidentKey: &fv,
+					ResidentKey:        protocol.ResidentKeyRequirementPreferred,
+				},
+			},
+		},
+		{
+			name: "PublicKeyCredentialHints",
+			opts: []RegistrationOption{WithPublicKeyCredentialHints([]protocol.PublicKeyCredentialHints{
+				protocol.PublicKeyCredentialHintSecurityKey,
+			})},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Hints: []protocol.PublicKeyCredentialHints{
+					protocol.PublicKeyCredentialHintSecurityKey,
+				},
+			},
+		},
+		{
+			name: "ConveyancePreference",
+			opts: []RegistrationOption{WithConveyancePreference(protocol.PreferEnterpriseAttestation)},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Attestation: protocol.PreferEnterpriseAttestation,
+			},
+		},
+		{
+			name: "AttestationFormats",
+			opts: []RegistrationOption{WithAttestationFormats([]protocol.AttestationFormat{protocol.AttestationFormatPacked})},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				AttestationFormats: []protocol.AttestationFormat{protocol.AttestationFormatPacked},
+			},
+		},
+		{
+			name: "Extensions",
+			opts: []RegistrationOption{WithExtensions(WithExtensionCredProps())},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Extensions: protocol.AuthenticationExtensions{CredProps: true},
+			},
+		},
+		{
+			// The option itself no longer inspects the exclude list; the appid is discarded by
+			// BeginRegistration instead, which TestBeginRegistrationAppIDExcludePruning covers.
+			name: "AppIDExcludeExtensionWithNoExclusions",
+			opts: []RegistrationOption{WithAppIdExcludeExtension("apple")},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				Extensions: protocol.AuthenticationExtensions{AppIDExclude: "apple"},
+			},
+		},
+		{
+			name: "AppIDExcludeExtensionWithExclusions",
+			opts: []RegistrationOption{WithExclusions([]protocol.CredentialDescriptor{
+				{Type: protocol.PublicKeyCredentialType, AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor), CredentialID: []byte("123"), Transport: []protocol.AuthenticatorTransport{protocol.Hybrid}},
+			}), WithAppIdExcludeExtension("apple")},
+			expected: protocol.PublicKeyCredentialCreationOptions{
+				CredentialExcludeList: []protocol.CredentialDescriptor{
+					{Type: protocol.PublicKeyCredentialType, AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor), CredentialID: []byte("123"), Transport: []protocol.AuthenticatorTransport{protocol.Hybrid}},
+				},
+				Extensions: protocol.AuthenticationExtensions{AppIDExclude: "apple"},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &tc.have
+
+			for _, opt := range tc.opts {
+				require.NoError(t, opt(opts))
+			}
+
+			assert.Equal(t, tc.expected, *opts)
+		})
+	}
+}
+
+func TestCreateCredential_Full(t *testing.T) {
+	credParams := []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}}
+
+	testCases := []struct {
+		name string
+		have struct {
+			specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+			challenge  string
+			mediation  protocol.CredentialMediationRequirement
+			setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+		}
+		expected struct {
+			attestationType   string
+			attestationFormat string
+			err               string
+		}
+	}{
+		{
+			name: "ShouldSucceedNoneFormat",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorNoneES256,
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				attestationType:   "none",
+				attestationFormat: "none",
+			},
+		},
+		{
+			name: "ShouldSucceedPackedSelfFormat",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorPackedSelfES256,
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				attestationType:   "basic_surrogate",
+				attestationFormat: "packed",
+			},
+		},
+		{
+			name: "ShouldSucceedWithMDS",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorPackedSelfES256,
+				setup: func(t *testing.T, provider *mocks.MockMetadataProvider) {
+					t.Helper()
+
+					provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(nil, nil)
+					provider.EXPECT().GetValidateEntry(gomock.Any()).Return(false)
+				},
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				attestationType:   "basic_surrogate",
+				attestationFormat: "packed",
+			},
+		},
+		{
+			name: "ShouldFailWithMDSGetEntryError",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorPackedSelfES256,
+				setup: func(t *testing.T, provider *mocks.MockMetadataProvider) {
+					t.Helper()
+
+					provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("entry lookup failed"))
+				},
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				err: "Failed to validate authenticator metadata for Authenticator Attestation GUID 'df850e09-db6a-fbdf-ab51-697791506cfc'. Error occurred retrieving the metadata entry: entry lookup failed",
+			},
+		},
+		{
+			name: "ShouldSucceedWithMDSValidateStatusReports",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorPackedSelfES256,
+				setup: func(t *testing.T, provider *mocks.MockMetadataProvider) {
+					t.Helper()
+
+					provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(&metadata.Entry{
+						MetadataStatement: metadata.Statement{
+							AttestationTypes: metadata.AuthenticatorAttestationTypes{metadata.BasicSurrogate},
+						},
+					}, nil)
+					provider.EXPECT().GetValidateAttestationTypes(gomock.Any()).Return(true)
+					provider.EXPECT().GetValidateStatus(gomock.Any()).Return(true)
+					provider.EXPECT().ValidateStatusReports(gomock.Any(), gomock.Any()).Return(nil)
+					provider.EXPECT().GetValidateTrustAnchor(gomock.Any()).Return(false)
+				},
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				attestationType:   "basic_surrogate",
+				attestationFormat: "packed",
+			},
+		},
+		{
+			name: "ShouldFailVerifyError",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorNoneES256,
+				challenge:  "d3JvbmctY2hhbGxlbmdlLXdyb25nLWNoYWxsZW5nZSE",
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				err: "Error validating challenge",
+			},
+		},
+		{
+			name: "ShouldSucceedMediationConditional",
+			have: struct {
+				specVector func(t *testing.T) (body []byte, challenge string, credentialID []byte)
+				challenge  string
+				mediation  protocol.CredentialMediationRequirement
+				setup      func(t *testing.T, provider *mocks.MockMetadataProvider)
+			}{
+				specVector: testRegistrationSpecVectorNoneES256,
+				mediation:  protocol.MediationConditional,
+			},
+			expected: struct {
+				attestationType   string
+				attestationFormat string
+				err               string
+			}{
+				attestationType:   "none",
+				attestationFormat: "none",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, challenge, credentialID := tc.have.specVector(t)
+
+			parsedResponse, err := protocol.ParseCredentialCreationResponseBytes(body)
+			require.NoError(t, err)
+
+			if tc.have.challenge != "" {
+				challenge = tc.have.challenge
+			}
+
+			userID := []byte(testUserID)
+
+			config := &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+			}
+
+			if tc.have.setup != nil {
+				ctrl := gomock.NewController(t)
+
+				provider := mocks.NewMockMetadataProvider(ctrl)
+
+				tc.have.setup(t, provider)
+
+				config.MDS = provider
+			}
+
+			w := &WebAuthn{Config: config}
+
+			session := SessionData{
+				Challenge:  challenge,
+				UserID:     userID,
+				CredParams: credParams,
+				Mediation:  tc.have.mediation,
+			}
+
+			user := &defaultUser{id: userID}
+
+			credential, err := w.CreateCredential(user, session, parsedResponse)
+
+			if tc.expected.err != "" {
+				assert.Nil(t, credential)
+				assert.EqualError(t, err, tc.expected.err)
+			} else {
+				assert.NoError(t, err)
+				require.NotNil(t, credential)
+				assert.Equal(t, credentialID, credential.ID)
+				assert.Equal(t, tc.expected.attestationType, credential.AttestationType)
+				assert.Equal(t, tc.expected.attestationFormat, credential.AttestationFormat)
+			}
+		})
+	}
+}
+
+func TestCreateCredentialUsesSessionRelyingPartyID(t *testing.T) {
+	body, challenge, credentialID := testRegistrationSpecVectorNoneES256(t)
+
+	parsedResponse, err := protocol.ParseCredentialCreationResponseBytes(body)
+	require.NoError(t, err)
+
+	userID := []byte(testUserID)
+
+	w := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.com",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	session := SessionData{
+		Challenge:      challenge,
+		RelyingPartyID: "example.org",
+		UserID:         userID,
+		CredParams:     []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}},
+	}
+
+	credential, err := w.CreateCredential(&defaultUser{id: userID}, session, parsedResponse)
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+	assert.Equal(t, credentialID, credential.ID)
+}
+
+func TestCreateCredential_RejectsBackupStateWithoutBackupEligibility(t *testing.T) {
+	body, challenge, _ := testRegistrationSpecVectorNoneES256Flags(t, protocol.FlagUserPresent|protocol.FlagBackupState|protocol.FlagAttestedCredentialData)
+
+	parsedResponse, err := protocol.ParseCredentialCreationResponseBytes(body)
+	require.NoError(t, err)
+
+	userID := []byte(testUserID)
+
+	w := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	session := SessionData{
+		Challenge:  challenge,
+		UserID:     userID,
+		CredParams: []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}},
+	}
+
+	credential, err := w.CreateCredential(&defaultUser{id: userID}, session, parsedResponse)
+
+	assert.Nil(t, credential)
+	assert.EqualError(t, err, "Backup State Flag is true but Backup Eligible flag is false which is invalid")
+}
+
+func TestBeginRegistrationUserIDLength(t *testing.T) {
+	testCases := []struct {
+		name string
+		id   []byte
+		err  string
+	}{
+		{
+			name: "ShouldRejectEmpty",
+			id:   nil,
+			err:  "error generating credential creation: the user id must be between 1 and 64 bytes but it has a length of 0",
+		},
+		{
+			name: "ShouldAcceptMinimum",
+			id:   bytes.Repeat([]byte("a"), 1),
+		},
+		{
+			name: "ShouldAcceptMaximum",
+			id:   bytes.Repeat([]byte("a"), 64),
+		},
+		{
+			name: "ShouldRejectAboveMaximum",
+			id:   bytes.Repeat([]byte("a"), 65),
+			err:  "error generating credential creation: the user id must be between 1 and 64 bytes but it has a length of 65",
+		},
+	}
+
+	w, err := New(&Config{
+		RPID:          "example.com",
+		RPDisplayName: "Test Display Name",
+		RPOrigins:     []string{"https://example.com"},
+	})
+	require.NoError(t, err)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			creation, session, err := w.BeginRegistration(&defaultUser{id: tc.id})
+
+			if tc.err != "" {
+				assert.Nil(t, creation)
+				assert.Nil(t, session)
+				assert.EqualError(t, err, tc.err)
+			} else {
+				assert.NoError(t, err)
+				require.NotNil(t, creation)
+			}
+		})
+	}
+}
+
+func TestBeginRegistrationHintsSetAuthenticatorAttachment(t *testing.T) {
+	testCases := []struct {
+		name     string
+		hints    []protocol.PublicKeyCredentialHints
+		selected protocol.AuthenticatorAttachment
+		expected protocol.AuthenticatorAttachment
+	}{
+		{
+			name:     "ShouldSetCrossPlatformForSecurityKey",
+			hints:    []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintSecurityKey},
+			expected: protocol.CrossPlatform,
+		},
+		{
+			name:     "ShouldSetPlatformForClientDevice",
+			hints:    []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintClientDevice},
+			expected: protocol.Platform,
+		},
+		{
+			name:     "ShouldSetCrossPlatformForHybrid",
+			hints:    []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintHybrid},
+			expected: protocol.CrossPlatform,
+		},
+		{
+			name:     "ShouldUseTheFirstHint",
+			hints:    []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintClientDevice, protocol.PublicKeyCredentialHintSecurityKey},
+			expected: protocol.Platform,
+		},
+		{
+			name:     "ShouldNotOverrideAnExplicitAttachment",
+			hints:    []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintSecurityKey},
+			selected: protocol.Platform,
+			expected: protocol.Platform,
+		},
+		{
+			name:     "ShouldNotSetAnAttachmentWithoutHints",
+			expected: "",
+		},
+		{
+			name:     "ShouldNotSetAnAttachmentForAnUnknownHint",
+			hints:    []protocol.PublicKeyCredentialHints{"future-hint"},
+			expected: "",
+		},
+		{
+			name:     "ShouldUseTheFirstRecognisedHint",
+			hints:    []protocol.PublicKeyCredentialHints{"future-hint", protocol.PublicKeyCredentialHintSecurityKey},
+			expected: protocol.CrossPlatform,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(&Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					AuthenticatorAttachment: tc.selected,
+				},
+			})
+			require.NoError(t, err)
+
+			var opts []RegistrationOption
+
+			if len(tc.hints) != 0 {
+				opts = append(opts, WithPublicKeyCredentialHints(tc.hints))
+			}
+
+			creation, _, err := w.BeginRegistration(&defaultUser{id: []byte(testUserID)}, opts...)
+			require.NoError(t, err)
+			require.NotNil(t, creation)
+
+			assert.Equal(t, tc.expected, creation.Response.AuthenticatorSelection.AuthenticatorAttachment)
+			assert.Equal(t, tc.hints, creation.Response.Hints)
+		})
+	}
+}
+
+func TestBeginRegistrationUserHandleAfterOptions(t *testing.T) {
+	withUserHandle := func(id any) RegistrationOption {
+		return func(cco *protocol.PublicKeyCredentialCreationOptions) error {
+			cco.User.ID = id
+
+			return nil
+		}
+	}
+
+	testCases := []struct {
+		name           string
+		encodeAsString bool
+		opts           []RegistrationOption
+		entity         any
+		expected       []byte
+		err            string
+	}{
+		{
+			name: "ShouldRejectAnEmptyHandleSetByAnOption",
+			opts: []RegistrationOption{withUserHandle(protocol.URLEncodedBase64(nil))},
+			err:  "error generating credential creation: the user id must be between 1 and 64 bytes but it has a length of 0",
+		},
+		{
+			name: "ShouldRejectAnOverlengthHandleSetByAnOption",
+			opts: []RegistrationOption{withUserHandle(protocol.URLEncodedBase64(bytes.Repeat([]byte("a"), 65)))},
+			err:  "error generating credential creation: the user id must be between 1 and 64 bytes but it has a length of 65",
+		},
+		{
+			name:     "ShouldSendAHandleSetByAnOptionButRecordTheUsersInTheSession",
+			opts:     []RegistrationOption{withUserHandle(protocol.URLEncodedBase64("replacement"))},
+			entity:   protocol.URLEncodedBase64("replacement"),
+			expected: []byte(testUserID),
+		},
+		{
+			name:           "ShouldSendAStringHandleSetByAnOptionButRecordTheUsersInTheSession",
+			encodeAsString: true,
+			opts:           []RegistrationOption{withUserHandle("replacement")},
+			entity:         "replacement",
+			expected:       []byte(testUserID),
+		},
+		{
+			name: "ShouldRejectAHandleOfAnUnusableType",
+			opts: []RegistrationOption{withUserHandle(42)},
+			err:  "error generating credential creation: the user id must be a string, []byte, or protocol.URLEncodedBase64 but it has a type of int",
+		},
+		{
+			name:     "ShouldRecordTheUsersHandleWithoutAnOption",
+			entity:   protocol.URLEncodedBase64(testUserID),
+			expected: []byte(testUserID),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(&Config{
+				RPID:                 "example.com",
+				RPDisplayName:        "Test Display Name",
+				RPOrigins:            []string{"https://example.com"},
+				EncodeUserIDAsString: tc.encodeAsString,
+			})
+			require.NoError(t, err)
+
+			creation, session, err := w.BeginRegistration(&defaultUser{id: []byte(testUserID)}, tc.opts...)
+
+			if tc.err != "" {
+				assert.Nil(t, creation)
+				assert.Nil(t, session)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, creation)
+			require.NotNil(t, session)
+			assert.Equal(t, tc.entity, creation.Response.User.ID)
+			assert.Equal(t, tc.expected, session.UserID)
+		})
+	}
+}
+
+func TestFinishRegistration_Success(t *testing.T) {
+	body, challenge, credentialID := testRegistrationSpecVectorNoneES256(t)
+	credParams := []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}}
+
+	userID := []byte(testUserID)
+
+	w := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	session := SessionData{
+		Challenge:  challenge,
+		UserID:     userID,
+		CredParams: credParams,
+	}
+
+	user := &defaultUser{id: userID}
+
+	reqBody := io.NopCloser(bytes.NewReader(body))
+	httpReq := &http.Request{Body: reqBody}
+
+	credential, err := w.FinishRegistration(user, session, httpReq)
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+	assert.Equal(t, credentialID, credential.ID)
+	assert.Equal(t, "none", credential.AttestationType)
+	assert.Equal(t, "none", credential.AttestationFormat)
+}
+
+func TestValidateFilteredCredential(t *testing.T) {
+	aaguidA := uuid.MustParse("00000000-0000-0000-0000-00000000000a")
+	aaguidB := uuid.MustParse("00000000-0000-0000-0000-00000000000b")
+	aaguidC := uuid.MustParse("00000000-0000-0000-0000-00000000000c")
+
+	credentialWith := func(aaguid uuid.UUID, backupEligible bool) *Credential {
+		b, _ := aaguid.MarshalBinary()
+
+		flags := protocol.FlagUserPresent
+		if backupEligible {
+			flags |= protocol.FlagBackupEligible
+		}
+
+		return &Credential{
+			Flags:         NewCredentialFlags(flags),
+			Authenticator: Authenticator{AAGUID: b},
+		}
+	}
+
+	testCases := []struct {
+		name       string
+		filtering  *FilteringConfig
+		credential *Credential
+		err        string
+	}{
+		{
+			name:       "ShouldAllowWhenFilteringNil",
+			filtering:  nil,
+			credential: credentialWith(aaguidA, true),
+		},
+		{
+			name:       "ShouldAllowNilCredentialWhenFilteringNil",
+			filtering:  nil,
+			credential: nil,
+		},
+		{
+			name:       "ShouldRejectNilCredentialWhenFilteringSet",
+			filtering:  &FilteringConfig{},
+			credential: nil,
+			err:        "Error reading the request data",
+		},
+		{
+			name:       "ShouldRejectNilCredentialWhenFilteringHasPermittedList",
+			filtering:  &FilteringConfig{PermittedAAGUIDs: []uuid.UUID{aaguidA}},
+			credential: nil,
+			err:        "Error reading the request data",
+		},
+		{
+			name:       "ShouldAllowWhenFilteringAllZeroValues",
+			filtering:  &FilteringConfig{},
+			credential: credentialWith(aaguidA, true),
+		},
+		{
+			name:       "ShouldRejectBackupEligibleWhenProhibited",
+			filtering:  &FilteringConfig{ProhibitBackupEligibility: true},
+			credential: credentialWith(aaguidA, true),
+			err:        "Policy restriction prevented the operation from completing",
+		},
+		{
+			name:       "ShouldAllowNonBackupEligibleWhenProhibited",
+			filtering:  &FilteringConfig{ProhibitBackupEligibility: true},
+			credential: credentialWith(aaguidA, false),
+		},
+		{
+			name:       "ShouldAllowBackupEligibleWhenNotProhibited",
+			filtering:  &FilteringConfig{ProhibitBackupEligibility: false},
+			credential: credentialWith(aaguidA, true),
+		},
+		{
+			name:      "ShouldRejectMalformedAAGUID",
+			filtering: &FilteringConfig{},
+			credential: &Credential{
+				Authenticator: Authenticator{AAGUID: []byte{0x01, 0x02, 0x03}},
+			},
+			err: "Error reading the request data",
+		},
+		{
+			name:       "ShouldAllowPermittedAAGUID",
+			filtering:  &FilteringConfig{PermittedAAGUIDs: []uuid.UUID{aaguidA, aaguidB}},
+			credential: credentialWith(aaguidA, false),
+		},
+		{
+			name:       "ShouldRejectAAGUIDNotInPermitList",
+			filtering:  &FilteringConfig{PermittedAAGUIDs: []uuid.UUID{aaguidA, aaguidB}},
+			credential: credentialWith(aaguidC, false),
+			err:        "Policy restriction prevented the operation from completing",
+		},
+		{
+			name:       "ShouldAllowZeroAAGUIDEvenWhenNotInPermitList",
+			filtering:  &FilteringConfig{PermittedAAGUIDs: []uuid.UUID{aaguidA}},
+			credential: credentialWith(uuid.Nil, false),
+		},
+		{
+			name:       "ShouldAllowZeroAAGUIDWhenExplicitlyInPermitList",
+			filtering:  &FilteringConfig{PermittedAAGUIDs: []uuid.UUID{uuid.Nil, aaguidA}},
+			credential: credentialWith(uuid.Nil, false),
+		},
+		{
+			name:       "ShouldRejectProhibitedAAGUID",
+			filtering:  &FilteringConfig{ProhibitedAAGUIDs: []uuid.UUID{aaguidB, aaguidC}},
+			credential: credentialWith(aaguidB, false),
+			err:        "Policy restriction prevented the operation from completing",
+		},
+		{
+			name:       "ShouldAllowAAGUIDNotInProhibitList",
+			filtering:  &FilteringConfig{ProhibitedAAGUIDs: []uuid.UUID{aaguidB, aaguidC}},
+			credential: credentialWith(aaguidA, false),
+		},
+		{
+			name: "ShouldApplyBothPermittedAndProhibitedListsWhenSet",
+			filtering: &FilteringConfig{
+				PermittedAAGUIDs:  []uuid.UUID{aaguidA, aaguidB},
+				ProhibitedAAGUIDs: []uuid.UUID{aaguidB},
+			},
+			credential: credentialWith(aaguidB, false),
+			err:        "Policy restriction prevented the operation from completing",
+		},
+		{
+			name: "ShouldAllowWhenPermittedAndNotProhibited",
+			filtering: &FilteringConfig{
+				PermittedAAGUIDs:  []uuid.UUID{aaguidA, aaguidB},
+				ProhibitedAAGUIDs: []uuid.UUID{aaguidC},
+			},
+			credential: credentialWith(aaguidA, false),
+		},
+		{
+			name: "ShouldCheckBackupEligibilityBeforeAAGUID",
+			filtering: &FilteringConfig{
+				ProhibitBackupEligibility: true,
+				PermittedAAGUIDs:          []uuid.UUID{aaguidA},
+			},
+			credential: credentialWith(aaguidC, true),
+			err:        "Policy restriction prevented the operation from completing",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateFilteredCredential(tc.credential, tc.filtering)
+
+			if tc.err == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.EqualError(t, err, tc.err)
+			}
+		})
+	}
+}
+
+// testRegistrationSpecVectorNoneES256 returns the spec test vector data for NoneES256 registration.
+// See: https://www.w3.org/TR/webauthn-3/#sctn-test-vectors-none-es256
+func testRegistrationSpecVectorNoneES256(t *testing.T) (body []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	// The flags of the vector as published: UP, BE, BS, and AT.
+	return testRegistrationSpecVectorNoneES256Flags(t, protocol.FlagUserPresent|protocol.FlagBackupEligible|protocol.FlagBackupState|protocol.FlagAttestedCredentialData)
+}
+
+// testRegistrationSpecVectorNoneES256Flags returns the spec test vector data for NoneES256 registration with the
+// authenticator data flags byte replaced by flags. The none attestation statement format conveys no signature over
+// the authenticator data, so the flags can be varied without invalidating the vector.
+func testRegistrationSpecVectorNoneES256Flags(t *testing.T, flags protocol.AuthenticatorFlags) (body []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	const (
+		attestationObjectHex = "a363666d74646e6f6e656761747453746d74a068617574684461746158a4bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b559000000008446ccb9ab1db374750b2367ff6f3a1f0020f91f391db4c9b2fde0ea70189cba3fb63f579ba6122b33ad94ff3ec330084be4a5010203262001215820afefa16f97ca9b2d23eb86ccb64098d20db90856062eb249c33a9b672f26df61225820930a56b87a2fca66334b03458abf879717c12cc68ed73290af2e2664796b9220"
+		clientDataJSONHex    = "7b2274797065223a22776562617574686e2e637265617465222c226368616c6c656e6765223a22414d4d507434557878475453746e63647134313759447742466938767049612d7077386f4f755657345441222c226f726967696e223a2268747470733a2f2f6578616d706c652e6f7267222c2263726f73734f726967696e223a66616c73652c22657874726144617461223a22636c69656e74446174614a534f4e206d617920626520657874656e6465642077697468206164646974696f6e616c206669656c647320696e20746865206675747572652c207375636820617320746869733a20426b5165446a646354427258426941774a544c453551227d"
+		credentialIDHex      = "f91f391db4c9b2fde0ea70189cba3fb63f579ba6122b33ad94ff3ec330084be4" //nolint:gosec
+		challengeHex         = "00c30fb78531c464d2b6771dab8d7b603c01162f2fa486bea70f283ae556e130"
+
+		// The flags byte of the authenticator data immediately follows the RP ID hash, which is what makes this
+		// prefix sufficient to locate it unambiguously within the attestation object.
+		rpIDHashHex   = "bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b5"
+		vectorFlagHex = "59"
+	)
+
+	credentialID, err := hex.DecodeString(credentialIDHex)
+	require.NoError(t, err)
+
+	challenge = base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, challengeHex))
+
+	attestationObjectFlagsHex := strings.Replace(attestationObjectHex, rpIDHashHex+vectorFlagHex, rpIDHashHex+hex.EncodeToString([]byte{byte(flags)}), 1)
+	require.Contains(t, attestationObjectFlagsHex, rpIDHashHex+hex.EncodeToString([]byte{byte(flags)}))
+
+	id := base64.RawURLEncoding.EncodeToString(credentialID)
+	attObj := base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, attestationObjectFlagsHex))
+	cdj := base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, clientDataJSONHex))
+
+	response := map[string]any{
+		"id":    id,
+		"rawId": id,
+		"type":  "public-key",
+		"response": map[string]any{
+			"attestationObject": attObj,
+			"clientDataJSON":    cdj,
+		},
+	}
+
+	body, err = json.Marshal(response)
+	require.NoError(t, err)
+
+	return body, challenge, credentialID
+}
+
+// testRegistrationSpecVectorNoneES256Origin returns the spec test vector data for NoneES256 registration with the
+// origin of the client data replaced by origin. The none attestation statement format conveys no signature over the
+// client data, so the origin can be varied without invalidating the vector.
+func testRegistrationSpecVectorNoneES256Origin(t *testing.T, origin string) (body []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	body, challenge, credentialID = testRegistrationSpecVectorNoneES256(t)
+
+	var response map[string]any
+
+	require.NoError(t, json.Unmarshal(body, &response))
+
+	inner, ok := response["response"].(map[string]any)
+	require.True(t, ok)
+
+	encoded, ok := inner["clientDataJSON"].(string)
+	require.True(t, ok)
+
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	require.NoError(t, err)
+
+	var clientData map[string]any
+
+	require.NoError(t, json.Unmarshal(raw, &clientData))
+
+	clientData["origin"] = origin
+
+	if raw, err = json.Marshal(clientData); err != nil {
+		require.NoError(t, err)
+	}
+
+	inner["clientDataJSON"] = base64.RawURLEncoding.EncodeToString(raw)
+
+	body, err = json.Marshal(response)
+	require.NoError(t, err)
+
+	return body, challenge, credentialID
+}
+
+// TestCreateCredentialOpaqueOrigin covers [Config.RPOpaqueOrigins] widening the set of origins a ceremony may be
+// performed from, which is the only place an origin that is not an http or https tuple origin can be declared.
+func TestCreateCredentialOpaqueOrigin(t *testing.T) {
+	const origin = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+
+	testCases := []struct {
+		name            string
+		rpOpaqueOrigins []string
+		err             string
+	}{
+		{
+			name:            "ShouldAcceptAConfiguredOpaqueOrigin",
+			rpOpaqueOrigins: []string{origin},
+		},
+		{
+			name: "ShouldRejectAnOpaqueOriginWhichIsNotConfigured",
+			err:  "Error validating origin",
+		},
+		{
+			name:            "ShouldRejectAnOpaqueOriginWhichDoesNotMatch",
+			rpOpaqueOrigins: []string{"android:apk-key-hash:9C4B4AEEF05536E730EC4B802E767F67"},
+			err:             "Error validating origin",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, challenge, credentialID := testRegistrationSpecVectorNoneES256Origin(t, origin)
+
+			parsedResponse, err := protocol.ParseCredentialCreationResponseBytes(body)
+			require.NoError(t, err)
+
+			userID := []byte(testUserID)
+
+			w := &WebAuthn{
+				Config: &Config{
+					RPID:            "example.org",
+					RPOrigins:       []string{"https://example.org"},
+					RPOpaqueOrigins: tc.rpOpaqueOrigins,
+				},
+			}
+
+			session := SessionData{
+				Challenge:  challenge,
+				UserID:     userID,
+				CredParams: []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}},
+			}
+
+			credential, err := w.CreateCredential(&defaultUser{id: userID}, session, parsedResponse)
+
+			if tc.err != "" {
+				assert.Nil(t, credential)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, credential)
+			assert.Equal(t, credentialID, credential.ID)
+		})
+	}
+}
+
+// TestBeginRegistrationOrigin covers [WithRegistrationOrigin] recording the bound origin in the session, and the
+// narrowing rule which requires the bound value to be one of the configured [Config.RPOrigins].
+func TestBeginRegistrationOrigin(t *testing.T) {
+	const opaque = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+
+	testCases := []struct {
+		name            string
+		origin          string
+		rpOpaqueOrigins []string
+		expected        string
+		err             string
+	}{
+		{
+			name:     "ShouldNotBindAnOriginWhenTheOptionIsNotSupplied",
+			expected: "",
+		},
+		{
+			name:     "ShouldBindAConfiguredOrigin",
+			origin:   "https://b.example.com",
+			expected: "https://b.example.com",
+		},
+		{
+			name:     "ShouldBindAConfiguredOriginWithAnExplicitDefaultPort",
+			origin:   "https://b.example.com:443",
+			expected: "https://b.example.com:443",
+		},
+		{
+			name:   "ShouldRejectAnOriginWhichIsNotConfigured",
+			origin: "https://c.example.com",
+			err:    "error generating credential creation: the ceremony origin 'https://c.example.com' must be one of the origins in the 'RPOrigins' configuration",
+		},
+		{
+			name:            "ShouldRejectAnOpaqueOriginEvenWhenItIsConfigured",
+			origin:          opaque,
+			rpOpaqueOrigins: []string{opaque},
+			err:             "error generating credential creation: the ceremony origin 'android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk' can't be bound as it's opaque and an opaque origin is only conveyed in the ceremony response",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(&Config{
+				RPID:            "example.com",
+				RPDisplayName:   "Test",
+				RPOrigins:       []string{"https://a.example.com", "https://b.example.com"},
+				RPOpaqueOrigins: tc.rpOpaqueOrigins,
+			})
+			require.NoError(t, err)
+
+			var opts []RegistrationOption
+
+			if tc.origin != "" {
+				opts = append(opts, WithRegistrationOrigin(tc.origin))
+			}
+
+			creation, session, err := w.BeginRegistration(&defaultUser{id: []byte(testUserID)}, opts...)
+
+			if tc.err != "" {
+				assert.Nil(t, creation)
+				assert.Nil(t, session)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, session)
+			assert.Equal(t, tc.expected, session.Origin)
+		})
+	}
+}
+
+// TestCreateCredentialBoundOrigin covers [SessionData.Origin] narrowing the origins the registration ceremony is
+// verified against to the single origin the ceremony was begun with.
+func TestCreateCredentialBoundOrigin(t *testing.T) {
+	const (
+		originVector = "https://example.org"
+		originOther  = "https://other.example.org"
+		originOpaque = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+	)
+
+	testCases := []struct {
+		name            string
+		responseOrigin  string
+		sessionOrigin   string
+		rpOpaqueOrigins []string
+		err             string
+	}{
+		{
+			name:          "ShouldAcceptTheBoundOrigin",
+			sessionOrigin: originVector,
+		},
+		{
+			name: "ShouldAcceptAnyConfiguredOriginWhenTheSessionIsNotBound",
+		},
+		{
+			name:          "ShouldRejectAnotherConfiguredOriginWhenTheSessionIsBound",
+			sessionOrigin: originOther,
+			err:           "Error validating origin",
+		},
+		{
+			name:            "ShouldAcceptAConfiguredOpaqueOriginWhileTheSessionIsBound",
+			responseOrigin:  originOpaque,
+			sessionOrigin:   originVector,
+			rpOpaqueOrigins: []string{originOpaque},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				body         []byte
+				challenge    string
+				credentialID []byte
+			)
+
+			if tc.responseOrigin == "" {
+				body, challenge, credentialID = testRegistrationSpecVectorNoneES256(t)
+			} else {
+				body, challenge, credentialID = testRegistrationSpecVectorNoneES256Origin(t, tc.responseOrigin)
+			}
+
+			parsedResponse, err := protocol.ParseCredentialCreationResponseBytes(body)
+			require.NoError(t, err)
+
+			userID := []byte(testUserID)
+
+			w := &WebAuthn{
+				Config: &Config{
+					RPID:            "example.org",
+					RPOrigins:       []string{originVector, originOther},
+					RPOpaqueOrigins: tc.rpOpaqueOrigins,
+				},
+			}
+
+			session := SessionData{
+				Challenge:  challenge,
+				Origin:     tc.sessionOrigin,
+				UserID:     userID,
+				CredParams: []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}},
+			}
+
+			credential, err := w.CreateCredential(&defaultUser{id: userID}, session, parsedResponse)
+
+			if tc.err != "" {
+				assert.Nil(t, credential)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, credential)
+			assert.Equal(t, credentialID, credential.ID)
+		})
+	}
+}
+
+// testRegistrationSpecVectorPackedSelfES256 returns the spec test vector data for Packed Self ES256 registration.
+// See: https://www.w3.org/TR/webauthn-3/#sctn-test-vectors-packed-self-es256
+func testRegistrationSpecVectorPackedSelfES256(t *testing.T) (body []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	const (
+		attestationObjectHex = "a363666d74667061636b65646761747453746d74a263616c672663736967584630440220067a20754ab925005dbf378097c92120031581c73228d1fb4f5b881bcd7da98302207fc7b147558c7c0eba3af18bd9d121fa3d3a26d17fe3f220272178f473b6006d68617574684461746158a4bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b55d00000000df850e09db6afbdfab51697791506cfc0020455ef34e2043a87db3d4afeb39bbcb6cc32df9347c789a865ecdca129cbef58ca5010203262001215820eb151c8176b225cc651559fecf07af450fd85802046656b34c18f6cf193843c5225820927b8aa427a2be1b8834d233a2d34f61f13bfd44119c325d5896e183fee484f2"
+		clientDataJSONHex    = "7b2274797065223a22776562617574686e2e637265617465222c226368616c6c656e6765223a2265476e4374334c55745936366b336a506a796e6962506b31716e666644616966715a774c33417032392d55222c226f726967696e223a2268747470733a2f2f6578616d706c652e6f7267222c2263726f73734f726967696e223a66616c73652c22657874726144617461223a22636c69656e74446174614a534f4e206d617920626520657874656e6465642077697468206164646974696f6e616c206669656c647320696e20746865206675747572652c207375636820617320746869733a205539685458764b453255526b4d6e625f307859485667227d"
+		credentialIDHex      = "455ef34e2043a87db3d4afeb39bbcb6cc32df9347c789a865ecdca129cbef58c" //nolint:gosec
+		challengeHex         = "7869c2b772d4b58eba9378cf8f29e26cf935aa77df0da89fa99c0bdc0a76f7e5"
+	)
+
+	credentialID, err := hex.DecodeString(credentialIDHex)
+	require.NoError(t, err)
+
+	challenge = base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, challengeHex))
+
+	id := base64.RawURLEncoding.EncodeToString(credentialID)
+	attObj := base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, attestationObjectHex))
+	cdj := base64.RawURLEncoding.EncodeToString(testRegDecodeHex(t, clientDataJSONHex))
+
+	response := map[string]any{
+		"id":    id,
+		"rawId": id,
+		"type":  "public-key",
+		"response": map[string]any{
+			"attestationObject": attObj,
+			"clientDataJSON":    cdj,
+		},
+	}
+
+	body, err = json.Marshal(response)
+	require.NoError(t, err)
+
+	return body, challenge, credentialID
+}
+
+func TestBeginRegistrationOptionError(t *testing.T) {
+	w, err := New(&Config{RPID: "example.com", RPDisplayName: "Test", RPOrigins: []string{"https://example.com"}})
+	require.NoError(t, err)
+
+	opt := func(cco *protocol.PublicKeyCredentialCreationOptions) error {
+		return fmt.Errorf("boom")
+	}
+
+	creation, session, err := w.BeginRegistration(&defaultUser{id: []byte("1234567890")}, opt)
+
+	assert.Nil(t, creation)
+	assert.Nil(t, session)
+	assert.EqualError(t, err, "error applying registration option: boom")
+}
+
+func TestBeginRegistration_StoresSessionExtensions(t *testing.T) {
+	w, err := New(&Config{RPID: "example.com", RPDisplayName: "Test", RPOrigins: []string{"https://example.com"}})
+	require.NoError(t, err)
+
+	_, session, err := w.BeginRegistration(&defaultUser{id: []byte("1234567890")}, WithExtensions(
+		WithExtensionCredProps(),
+		WithExtensionLargeBlobSupport(protocol.LargeBlobSupportRequired),
+	))
+	require.NoError(t, err)
+
+	// Registration ceremonies previously stored no extensions in the session at all.
+	assert.Equal(t, protocol.SessionExtensions{
+		Requested: []string{protocol.ExtensionCredProps, protocol.ExtensionLargeBlob},
+		LargeBlob: protocol.LargeBlobSupportRequired,
+	}, session.Extensions)
+}
+
+func TestBeginRegistrationAppIDExcludePruning(t *testing.T) {
+	u2f := protocol.CredentialDescriptor{
+		Type:              protocol.PublicKeyCredentialType,
+		CredentialID:      []byte("u2f-credential"),
+		AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor),
+	}
+
+	packed := protocol.CredentialDescriptor{
+		Type:              protocol.PublicKeyCredentialType,
+		CredentialID:      []byte("packed-credential"),
+		AttestationFormat: string(protocol.AttestationFormatPacked),
+	}
+
+	testCases := []struct {
+		name     string
+		exclude  []protocol.CredentialDescriptor
+		expected string
+	}{
+		{"U2FPresent", []protocol.CredentialDescriptor{packed, u2f}, "https://example.com"},
+		{"NoU2F", []protocol.CredentialDescriptor{packed}, ""},
+		{"Empty", nil, ""},
+	}
+
+	for _, tc := range testCases {
+		// Both orderings must produce identical results; the option previously read the exclude list at the moment
+		// it ran, so listing it first silently did nothing.
+		t.Run(tc.name+"/OptionAfterExclusions", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			creation, session, err := w.BeginRegistration(newTestUser(t),
+				WithExclusions(tc.exclude),
+				WithExtensions(WithExtensionAppIDExclude("https://example.com")),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, creation.Response.Extensions.AppIDExclude)
+			assert.Equal(t, tc.expected, session.Extensions.AppIDExclude)
+		})
+
+		t.Run(tc.name+"/OptionBeforeExclusions", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			creation, session, err := w.BeginRegistration(newTestUser(t),
+				WithExtensions(WithExtensionAppIDExclude("https://example.com")),
+				WithExclusions(tc.exclude),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, creation.Response.Extensions.AppIDExclude)
+			assert.Equal(t, tc.expected, session.Extensions.AppIDExclude)
+		})
+
+		// The deprecated wrapper delegates to the same option and must therefore be pruned identically.
+		t.Run(tc.name+"/DeprecatedWrapperBeforeExclusions", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			creation, session, err := w.BeginRegistration(newTestUser(t),
+				WithAppIdExcludeExtension("https://example.com"),
+				WithExclusions(tc.exclude),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, creation.Response.Extensions.AppIDExclude)
+			assert.Equal(t, tc.expected, session.Extensions.AppIDExclude)
+		})
+	}
+}
+
+func TestBeginRegistrationAppIDExcludePruningUpdatesRequested(t *testing.T) {
+	w := newTestWebAuthn(t)
+
+	_, session, err := w.BeginRegistration(newTestUser(t),
+		WithExtensions(WithExtensionAppIDExclude("https://example.com"), WithExtensionCredProps()),
+	)
+
+	require.NoError(t, err)
+	assert.NotContains(t, session.Extensions.Requested, protocol.ExtensionAppIDExclude)
+	assert.Contains(t, session.Extensions.Requested, protocol.ExtensionCredProps)
+}
+
+func TestCreateCredentialRejectsUnsolicitedExtensionOutput(t *testing.T) {
+	w, session, response := newRegistrationFixture(t)
+
+	response.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{
+		CredProps: &protocol.CredentialPropertiesOutput{RK: ptr(true)},
+	}
+	session.Extensions = protocol.SessionExtensions{}
+
+	credential, err := w.CreateCredential(newTestUser(t), session, response)
+
+	assert.Nil(t, credential)
+	assert.ErrorContains(t, err, "credProps")
+}
+
+func TestCreateCredentialAcceptsSolicitedExtensionOutput(t *testing.T) {
+	// The sibling of the rejection case: the same output must pass once the session records that it was asked
+	// for, so the check is known to discriminate rather than to reject the extension outright.
+	w, session, response := newRegistrationFixture(t)
+
+	response.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{
+		CredProps: &protocol.CredentialPropertiesOutput{RK: ptr(true)},
+	}
+	session.Extensions = protocol.SessionExtensions{Requested: []string{protocol.ExtensionCredProps}}
+
+	credential, err := w.CreateCredential(newTestUser(t), session, response)
+
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+
+	require.NotNil(t, credential.Extensions.RK)
+	assert.True(t, *credential.Extensions.RK)
+}
+
+func testRegDecodeHex(t *testing.T, s string) []byte {
+	t.Helper()
+
+	data, err := hex.DecodeString(s)
+	require.NoError(t, err)
+
+	return data
+}
+
+// testUserID is the user handle shared by [newTestUser], [newRegistrationFixture] and the login tests.
+// [WebAuthn.CreateCredential] and [WebAuthn.ValidateLogin] both reject a user whose handle differs from the one in
+// the session, so these must agree.
+const testUserID = "test-user-id"
+
+// newTestUser returns the [User] matching the session and response produced by [newRegistrationFixture]. It has no
+// credentials and is therefore unsuitable for [WebAuthn.BeginLogin], which requires at least one.
+func newTestUser(t *testing.T) User {
+	t.Helper()
+
+	return &defaultUser{id: []byte(testUserID)}
+}
+
+// newTestWebAuthn returns a [*WebAuthn] with the minimal valid configuration used by the ceremony tests.
+func newTestWebAuthn(t *testing.T) *WebAuthn {
+	t.Helper()
+
+	w, err := New(&Config{RPID: "example.com", RPDisplayName: "Test", RPOrigins: []string{"https://example.com"}})
+	require.NoError(t, err)
+
+	return w
+}
+
+// newRegistrationFixture returns a configured [*WebAuthn], a [SessionData], and a
+// [*protocol.ParsedCredentialCreationData] that verifies cleanly against each other, for tests that need a
+// successful registration to then mutate.
+func newRegistrationFixture(t *testing.T) (w *WebAuthn, session SessionData, response *protocol.ParsedCredentialCreationData) {
+	t.Helper()
+
+	body, challenge, _ := testRegistrationSpecVectorNoneES256(t)
+	credParams := []protocol.CredentialParameter{{Type: protocol.PublicKeyCredentialType, Algorithm: webauthncose.AlgES256}}
+
+	userID := []byte(testUserID)
+
+	w = &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	session = SessionData{
+		Challenge:  challenge,
+		UserID:     userID,
+		CredParams: credParams,
+	}
+
+	response, err := protocol.ParseCredentialCreationResponseBytes(body)
+	require.NoError(t, err)
+
+	return w, session, response
+}
+
+func TestCreateCredentialRejectsUnhonouredCredentialProtectionPolicy(t *testing.T) {
+	// End to end cover for the authenticator extension output check: the session required enforcement, and this
+	// authenticator's data carries no extension outputs at all, so it cannot have honoured the policy.
+	w, session, response := newRegistrationFixture(t)
+
+	session.Extensions = protocol.SessionExtensions{
+		Requested:                         []string{protocol.ExtensionCredentialProtectionPolicy},
+		CredentialProtectionPolicy:        protocol.CredentialProtectionPolicyUserVerificationRequired,
+		EnforceCredentialProtectionPolicy: true,
+	}
+
+	credential, err := w.CreateCredential(newTestUser(t), session, response)
+
+	assert.Nil(t, credential)
+	assert.ErrorContains(t, err, "credentialProtectionPolicy")
+	assert.ErrorContains(t, err, "did not report the policy")
+}
+
+func TestCreateCredentialPropagatesFilteringFailure(t *testing.T) {
+	// The filtering step runs after the credential is built, so its rejection has to reach the caller rather than
+	// yielding a credential the configuration prohibits.
+	w, session, response := newRegistrationFixture(t)
+
+	w.Config.Filtering = &FilteringConfig{ProhibitBackupEligibility: true}
+
+	credential, err := w.CreateCredential(newTestUser(t), session, response)
+
+	assert.Nil(t, credential)
+	require.NotNil(t, err)
+
+	// The rejection reason is carried in DevInfo rather than the message, which is deliberately generic.
+	var e *protocol.Error
+
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, protocol.ErrPolicyRestriction.Type, e.Type)
+	assert.Contains(t, e.DevInfo, "Backup Eligible")
+}
+
+func TestBeginMediatedRegistrationRejectsInvalidConfig(t *testing.T) {
+	// The configuration is validated lazily on first use, so a WebAuthn built without New must fail the ceremony
+	// rather than emitting creation options derived from an incomplete configuration.
+	w := &WebAuthn{Config: &Config{}}
+
+	creation, session, err := w.BeginRegistration(newTestUser(t))
+
+	assert.Nil(t, creation)
+	assert.Nil(t, session)
+	assert.ErrorContains(t, err, "error occurred validating the configuration")
+}
+
+func TestCreateCredentialFailureSessionChallenge(t *testing.T) {
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	userHandle := []byte("0ToAAAAAAAAAAA")
+
+	testCases := []struct {
+		name      string
+		challenge string
+		info      string
+	}{
+		{"ShouldFailEmpty", "", "The challenge must be at least 16 bytes but it has a length of 0"},
+		{"ShouldFailShort", "d3JvbmctY2hhbGxlbmdl", "The challenge must be at least 16 bytes but it has a length of 15"},
+		{"ShouldFailInvalid", "not base64url!", "The challenge could not be decoded: illegal base64 data at input byte 3"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			user := &defaultUser{id: userHandle}
+
+			_, err := webauthn.CreateCredential(user, SessionData{UserID: userHandle, Challenge: tc.challenge}, &protocol.ParsedCredentialCreationData{})
+
+			var e *protocol.Error
+
+			require.ErrorAs(t, err, &e)
+			assert.Equal(t, "Session has an invalid challenge", e.Details)
+			assert.Equal(t, tc.info, e.DevInfo)
+		})
+	}
+}

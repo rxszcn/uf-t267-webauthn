@@ -1,0 +1,2160 @@
+package webauthn
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	"github.com/go-webauthn/webauthn/metadata"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/testing/mocks"
+)
+
+func TestLogin_FinishLoginFailure(t *testing.T) {
+	user := &defaultUser{
+		id: []byte("123"),
+	}
+
+	session := SessionData{
+		UserID: []byte("ABC"),
+	}
+
+	webauthn := &WebAuthn{}
+
+	credential, err := webauthn.FinishLogin(user, session, nil)
+	if err == nil {
+		t.Errorf("FinishLogin() error = nil, want %v", protocol.ErrBadRequest.Type)
+	}
+
+	if credential != nil {
+		t.Errorf("FinishLogin() credential = %v, want nil", credential)
+	}
+}
+
+func TestWithLoginRelyingPartyID(t *testing.T) {
+	testCases := []struct {
+		name              string
+		have              *Config
+		opts              []LoginOption
+		expectedID        string
+		expectedChallenge []byte
+		err               string
+	}{
+		{
+			name: "OptionDefinedInConfig",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts:       nil,
+			expectedID: "example.com",
+		},
+		{
+			name: "OptionDefinedInConfigAndOpts",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts:       []LoginOption{WithLoginRelyingPartyID("a.example.com")},
+			expectedID: "a.example.com",
+		},
+		{
+			name: "OptionDefinedInConfigWithNoErrAndInOptsWithError",
+			have: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts: []LoginOption{WithLoginRelyingPartyID("---::~!!~@#M!@OIK#N!@IOK@@@@@@@@@@")},
+			err:  "error generating assertion: the relying party id failed to validate as it's not a valid domain string with error: parse \"---::~!!~@\": first path segment in URL cannot contain colon",
+		},
+		{
+			name: "OptionDefinedInOpts",
+			have: &Config{
+				RPOrigins: []string{"https://example.com"},
+			},
+			opts:       []LoginOption{WithLoginRelyingPartyID("example.com")},
+			expectedID: "example.com",
+		},
+		{
+			name: "OptionIDNotDefined",
+			have: &Config{
+				RPOrigins: []string{"https://example.com"},
+			},
+			opts: nil,
+			err:  "error generating assertion: the relying party id must be provided via the configuration or a functional option for a login",
+		},
+		{
+			name: "TooShortWithChallengeOption",
+			have: &Config{
+				RPID:          "example.com",
+				RPOrigins:     []string{"https://example.com"},
+				RPDisplayName: "Test Display Name",
+			},
+			opts: []LoginOption{WithChallenge([]byte("1234567890"))},
+			err:  "error generating assertion: the challenge must be at least 16 bytes",
+		},
+		{
+			name: "WithChallengeOption",
+			have: &Config{
+				RPID:          "example.com",
+				RPOrigins:     []string{"https://example.com"},
+				RPDisplayName: "Test Display Name",
+			},
+			opts:              []LoginOption{WithChallenge([]byte("00000000000000000000000000000000"))},
+			expectedID:        "example.com",
+			expectedChallenge: []byte("00000000000000000000000000000000"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.have)
+			assert.NoError(t, err)
+
+			user := &defaultUser{
+				credentials: []Credential{
+					{},
+				},
+			}
+
+			creation, _, err := w.BeginLogin(user, tc.opts...)
+			if tc.err != "" {
+				assert.EqualError(t, err, tc.err)
+			} else {
+				assert.NoError(t, err)
+				require.NotNil(t, creation)
+				assert.Equal(t, tc.expectedID, creation.Response.RelyingPartyID)
+
+				if len(tc.expectedChallenge) > 0 {
+					assert.Equal(t, protocol.URLEncodedBase64(tc.expectedChallenge).String(), creation.Response.Challenge.String())
+				}
+			}
+		})
+	}
+}
+
+func TestFinishLoginFailure(t *testing.T) {
+	const (
+		credentialID = "AI7D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		userHandle   = "0ToAAAAAAAAAAA"
+	)
+
+	var (
+		byteUserHandle, _       = base64.RawURLEncoding.DecodeString(userHandle)
+		byteID, _               = base64.RawURLEncoding.DecodeString(credentialID)
+		byteCredentialPubKey, _ = base64.RawURLEncoding.DecodeString("pQMmIAEhWCAoCF-x0dwEhzQo-ABxHIAgr_5WL6cJceREc81oIwFn7iJYIHEHx8ZhBIE42L26-rSC_3l0ZaWEmsHAKyP9rgslApUdAQI")
+		byteAAGUID, _           = base64.RawURLEncoding.DecodeString("rc4AAjW8xgpkiwsl8fBVAw")
+	)
+
+	credentials := []Credential{
+		{
+			ID:        byteID,
+			PublicKey: byteCredentialPubKey,
+			Authenticator: Authenticator{
+				AAGUID: byteAAGUID,
+			},
+		},
+	}
+
+	user := &defaultUser{
+		id:          byteUserHandle,
+		credentials: credentials,
+	}
+
+	session := SessionData{
+		UserID:               byteUserHandle,
+		Challenge:            "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k",
+		AllowedCredentialIDs: [][]byte{[]byte("test"), byteID},
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	reqBody := io.NopCloser(bytes.NewReader([]byte(fmt.Sprintf(`{
+			"id":"%[1]s",
+			"rawId":"%[1]s",
+			"type":"public-key",
+			"response":{
+				"authenticatorData":"dKbqkhPJnC90siSSsyDPQCYqlMGpUKA5fyklC2CEHvBFXJJiGa3OAAI1vMYKZIsLJfHwVQMANwCOw-atj9C0vhWpfWU-whzNjeQS21Lpxfdk_G-omAtffWztpGoErlNOfuXWRqm9Uj9ANJck1p6lAQIDJiABIVggKAhfsdHcBIc0KPgAcRyAIK_-Vi-nCXHkRHPNaCMBZ-4iWCBxB8fGYQSBONi9uvq0gv95dGWlhJrBwCsj_a4LJQKVHQ",
+				"clientDataJSON":"eyJjaGFsbGVuZ2UiOiJFNFBUY0lIX0hmWDFwQzZTaWdrMVNDOU5BbGdlenROMDQzOXZpOHpfYzlrIiwibmV3X2tleXNfbWF5X2JlX2FkZGVkX2hlcmUiOiJkbyBub3QgY29tcGFyZSBjbGllbnREYXRhSlNPTiBhZ2FpbnN0IGEgdGVtcGxhdGUuIFNlZSBodHRwczovL2dvby5nbC95YWJQZXgiLCJvcmlnaW4iOiJodHRwczovL3dlYmF1dGhuLmlvIiwidHlwZSI6IndlYmF1dGhuLmdldCJ9",
+				"signature":"MEUCIBtIVOQxzFYdyWQyxaLR0tik1TnuPhGVhXVSNgFwLmN5AiEAnxXdCq0UeAVGWxOaFcjBZ_mEZoXqNboY5IkQDdlWZYc",
+				"userHandle":"%[2]s"
+			}
+		}`, credentialID, userHandle,
+	))))
+	httpReq := &http.Request{Body: reqBody}
+
+	_, err := webauthn.FinishLogin(user, session, httpReq)
+
+	require.Equal(t, protocol.ErrBadRequest.WithDetails("User does not own all credentials from the allowed credential list"), err)
+}
+
+func TestFinishLoginFailureCredentialOwnedButNotAllowedInSession(t *testing.T) {
+	const (
+		credentialIDOne = "AI7D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		credentialIDTwo = "AI6D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		userHandle      = "0ToAAAAAAAAAAA"
+	)
+
+	byteIDOne, err := base64.RawURLEncoding.DecodeString(credentialIDOne)
+	require.NoError(t, err)
+
+	byteIDTwo, err := base64.RawURLEncoding.DecodeString(credentialIDTwo)
+	require.NoError(t, err)
+
+	byteUserHandle, err := base64.RawURLEncoding.DecodeString(userHandle)
+	require.NoError(t, err)
+
+	byteCredentialPubKey, err := base64.RawURLEncoding.DecodeString("pQMmIAEhWCAoCF-x0dwEhzQo-ABxHIAgr_5WL6cJceREc81oIwFn7iJYIHEHx8ZhBIE42L26-rSC_3l0ZaWEmsHAKyP9rgslApUdAQI")
+	require.NoError(t, err)
+
+	byteAAGUID, err := base64.RawURLEncoding.DecodeString("rc4AAjW8xgpkiwsl8fBVAw")
+	require.NoError(t, err)
+
+	credentials := []Credential{
+		{
+			ID:        byteIDOne,
+			PublicKey: byteCredentialPubKey,
+			Authenticator: Authenticator{
+				AAGUID: byteAAGUID,
+			},
+		},
+		{
+			ID:        byteIDTwo,
+			PublicKey: byteCredentialPubKey,
+			Authenticator: Authenticator{
+				AAGUID: byteAAGUID,
+			},
+		},
+	}
+
+	user := &defaultUser{
+		id:          byteUserHandle,
+		credentials: credentials,
+	}
+
+	session := SessionData{
+		UserID:               byteUserHandle,
+		Challenge:            "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k",
+		AllowedCredentialIDs: [][]byte{byteIDOne},
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	reqBody := io.NopCloser(bytes.NewReader([]byte(fmt.Sprintf(`{
+			"id":"%[1]s",
+			"rawId":"%[1]s",
+			"type":"public-key",
+			"response":{
+				"authenticatorData":"dKbqkhPJnC90siSSsyDPQCYqlMGpUKA5fyklC2CEHvBFXJJiGa3OAAI1vMYKZIsLJfHwVQMANwCOw-atj9C0vhWpfWU-whzNjeQS21Lpxfdk_G-omAtffWztpGoErlNOfuXWRqm9Uj9ANJck1p6lAQIDJiABIVggKAhfsdHcBIc0KPgAcRyAIK_-Vi-nCXHkRHPNaCMBZ-4iWCBxB8fGYQSBONi9uvq0gv95dGWlhJrBwCsj_a4LJQKVHQ",
+				"clientDataJSON":"eyJjaGFsbGVuZ2UiOiJFNFBUY0lIX0hmWDFwQzZTaWdrMVNDOU5BbGdlenROMDQzOXZpOHpfYzlrIiwibmV3X2tleXNfbWF5X2JlX2FkZGVkX2hlcmUiOiJkbyBub3QgY29tcGFyZSBjbGllbnREYXRhSlNPTiBhZ2FpbnN0IGEgdGVtcGxhdGUuIFNlZSBodHRwczovL2dvby5nbC95YWJQZXgiLCJvcmlnaW4iOiJodHRwczovL3dlYmF1dGhuLmlvIiwidHlwZSI6IndlYmF1dGhuLmdldCJ9",
+				"signature":"MEUCIBtIVOQxzFYdyWQyxaLR0tik1TnuPhGVhXVSNgFwLmN5AiEAnxXdCq0UeAVGWxOaFcjBZ_mEZoXqNboY5IkQDdlWZYc",
+				"userHandle":"%[2]s"
+			}
+		}`, credentialIDTwo, userHandle,
+	))))
+	httpReq := &http.Request{Body: reqBody}
+
+	_, err = webauthn.FinishLogin(user, session, httpReq)
+
+	require.Equal(t, protocol.ErrBadRequest.WithDetails("The credential ID provided is not in the sessions allowed credential list"), err)
+}
+
+func TestFinishLoginFailureCredentialNotOwned(t *testing.T) {
+	const (
+		credentialIDOne = "AI7D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		credentialIDTwo = "AI6D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		userHandle      = "0ToAAAAAAAAAAA"
+	)
+
+	byteIDOne, err := base64.RawURLEncoding.DecodeString(credentialIDOne)
+	require.NoError(t, err)
+
+	byteUserHandle, err := base64.RawURLEncoding.DecodeString(userHandle)
+	require.NoError(t, err)
+
+	byteCredentialPubKey, err := base64.RawURLEncoding.DecodeString("pQMmIAEhWCAoCF-x0dwEhzQo-ABxHIAgr_5WL6cJceREc81oIwFn7iJYIHEHx8ZhBIE42L26-rSC_3l0ZaWEmsHAKyP9rgslApUdAQI")
+	require.NoError(t, err)
+
+	byteAAGUID, err := base64.RawURLEncoding.DecodeString("rc4AAjW8xgpkiwsl8fBVAw")
+	require.NoError(t, err)
+
+	credentials := []Credential{
+		{
+			ID:        byteIDOne,
+			PublicKey: byteCredentialPubKey,
+			Authenticator: Authenticator{
+				AAGUID: byteAAGUID,
+			},
+		},
+	}
+
+	user := &defaultUser{
+		id:          byteUserHandle,
+		credentials: credentials,
+	}
+
+	session := SessionData{
+		UserID:               byteUserHandle,
+		Challenge:            "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k",
+		AllowedCredentialIDs: [][]byte{byteIDOne},
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	reqBody := io.NopCloser(bytes.NewReader([]byte(fmt.Sprintf(`{
+			"id":"%[1]s",
+			"rawId":"%[1]s",
+			"type":"public-key",
+			"response":{
+				"authenticatorData":"dKbqkhPJnC90siSSsyDPQCYqlMGpUKA5fyklC2CEHvBFXJJiGa3OAAI1vMYKZIsLJfHwVQMANwCOw-atj9C0vhWpfWU-whzNjeQS21Lpxfdk_G-omAtffWztpGoErlNOfuXWRqm9Uj9ANJck1p6lAQIDJiABIVggKAhfsdHcBIc0KPgAcRyAIK_-Vi-nCXHkRHPNaCMBZ-4iWCBxB8fGYQSBONi9uvq0gv95dGWlhJrBwCsj_a4LJQKVHQ",
+				"clientDataJSON":"eyJjaGFsbGVuZ2UiOiJFNFBUY0lIX0hmWDFwQzZTaWdrMVNDOU5BbGdlenROMDQzOXZpOHpfYzlrIiwibmV3X2tleXNfbWF5X2JlX2FkZGVkX2hlcmUiOiJkbyBub3QgY29tcGFyZSBjbGllbnREYXRhSlNPTiBhZ2FpbnN0IGEgdGVtcGxhdGUuIFNlZSBodHRwczovL2dvby5nbC95YWJQZXgiLCJvcmlnaW4iOiJodHRwczovL3dlYmF1dGhuLmlvIiwidHlwZSI6IndlYmF1dGhuLmdldCJ9",
+				"signature":"MEUCIBtIVOQxzFYdyWQyxaLR0tik1TnuPhGVhXVSNgFwLmN5AiEAnxXdCq0UeAVGWxOaFcjBZ_mEZoXqNboY5IkQDdlWZYc",
+				"userHandle":"%[2]s"
+			}
+		}`, credentialIDTwo, userHandle,
+	))))
+	httpReq := &http.Request{Body: reqBody}
+
+	_, err = webauthn.FinishLogin(user, session, httpReq)
+
+	require.Equal(t, &protocol.ErrorUnknownCredential{Err: protocol.ErrBadRequest.WithDetails("The credential ID provided is not owned by the user")}, err)
+}
+
+func TestValidatePasskeyLoginFailureCredentialNotOwned(t *testing.T) {
+	const (
+		credentialIDOne = "AI7D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		credentialIDTwo = "AI6D5q2P0LS-Fal9ZT7CHM2N5BLbUunF92T8b6iYC199bO2kagSuU05-5dZGqb1SP0A0lyTWng" //nolint:gosec
+		userHandle      = "0ToAAAAAAAAAAA"
+	)
+
+	byteIDOne, err := base64.RawURLEncoding.DecodeString(credentialIDOne)
+	require.NoError(t, err)
+
+	byteUserHandle, err := base64.RawURLEncoding.DecodeString(userHandle)
+	require.NoError(t, err)
+
+	user := &defaultUser{
+		id:          byteUserHandle,
+		credentials: []Credential{{ID: byteIDOne}},
+	}
+
+	session := SessionData{
+		Challenge: "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k",
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	parsed, err := protocol.ParseCredentialRequestResponseBytes([]byte(fmt.Sprintf(`{
+			"id":"%[1]s",
+			"rawId":"%[1]s",
+			"type":"public-key",
+			"response":{
+				"authenticatorData":"dKbqkhPJnC90siSSsyDPQCYqlMGpUKA5fyklC2CEHvBFXJJiGa3OAAI1vMYKZIsLJfHwVQMANwCOw-atj9C0vhWpfWU-whzNjeQS21Lpxfdk_G-omAtffWztpGoErlNOfuXWRqm9Uj9ANJck1p6lAQIDJiABIVggKAhfsdHcBIc0KPgAcRyAIK_-Vi-nCXHkRHPNaCMBZ-4iWCBxB8fGYQSBONi9uvq0gv95dGWlhJrBwCsj_a4LJQKVHQ",
+				"clientDataJSON":"eyJjaGFsbGVuZ2UiOiJFNFBUY0lIX0hmWDFwQzZTaWdrMVNDOU5BbGdlenROMDQzOXZpOHpfYzlrIiwibmV3X2tleXNfbWF5X2JlX2FkZGVkX2hlcmUiOiJkbyBub3QgY29tcGFyZSBjbGllbnREYXRhSlNPTiBhZ2FpbnN0IGEgdGVtcGxhdGUuIFNlZSBodHRwczovL2dvby5nbC95YWJQZXgiLCJvcmlnaW4iOiJodHRwczovL3dlYmF1dGhuLmlvIiwidHlwZSI6IndlYmF1dGhuLmdldCJ9",
+				"signature":"MEUCIBtIVOQxzFYdyWQyxaLR0tik1TnuPhGVhXVSNgFwLmN5AiEAnxXdCq0UeAVGWxOaFcjBZ_mEZoXqNboY5IkQDdlWZYc",
+				"userHandle":"%[2]s"
+			}
+		}`, credentialIDTwo, userHandle,
+	)))
+	require.NoError(t, err)
+
+	handler := func(rawID, handle []byte) (User, error) {
+		return user, nil
+	}
+
+	actualUser, credential, err := webauthn.ValidatePasskeyLogin(handler, session, parsed)
+
+	assert.Nil(t, actualUser)
+	assert.Nil(t, credential)
+	require.Equal(t, &protocol.ErrorUnknownCredential{Err: protocol.ErrBadRequest.WithDetails("Unable to find the credential for the returned credential ID")}, err)
+
+	var unknown *protocol.ErrorUnknownCredential
+
+	assert.ErrorAs(t, err, &unknown)
+}
+
+func TestFinishDiscoverableLogin_Failure(t *testing.T) {
+	session := SessionData{}
+	webauthn := &WebAuthn{}
+
+	credential, err := webauthn.FinishDiscoverableLogin(nil, session, nil)
+	assert.Nil(t, credential)
+	assert.Error(t, err)
+}
+
+func TestFinishPasskeyLogin_Failure(t *testing.T) {
+	session := SessionData{}
+	webauthn := &WebAuthn{}
+
+	user, credential, err := webauthn.FinishPasskeyLogin(nil, session, nil)
+	assert.Nil(t, user)
+	assert.Nil(t, credential)
+	assert.Error(t, err)
+}
+
+func TestBeginLogin_EnforceTimeout(t *testing.T) {
+	config := &Config{
+		RPID:          "example.com",
+		RPDisplayName: "Test Display Name",
+		RPOrigins:     []string{"https://example.com"},
+		Timeouts: TimeoutsConfig{
+			Login: TimeoutConfig{
+				Enforce: true,
+				Timeout: time.Second * 60,
+			},
+		},
+	}
+
+	w, err := New(config)
+	require.NoError(t, err)
+
+	user := &defaultUser{
+		credentials: []Credential{{}},
+	}
+
+	_, session, err := w.BeginLogin(user)
+	require.NoError(t, err)
+	assert.False(t, session.Expires.IsZero())
+}
+
+func TestBeginDiscoverableLogin(t *testing.T) {
+	testCases := []struct {
+		name       string
+		config     *Config
+		opts       []LoginOption
+		expectedID string
+		err        string
+	}{
+		{
+			name: "ShouldSucceed",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			expectedID: "example.com",
+		},
+		{
+			name: "ShouldSucceedWithOpts",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			opts:       []LoginOption{WithUserVerification(protocol.VerificationRequired)},
+			expectedID: "example.com",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.config)
+			require.NoError(t, err)
+
+			assertion, session, err := w.BeginDiscoverableLogin(tc.opts...)
+			if tc.err != "" {
+				assert.EqualError(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, assertion)
+				require.NotNil(t, session)
+				assert.Equal(t, tc.expectedID, assertion.Response.RelyingPartyID)
+				assert.Empty(t, session.UserID)
+				assert.Empty(t, session.AllowedCredentialIDs)
+			}
+		})
+	}
+}
+
+func TestBeginDiscoverableMediatedLogin(t *testing.T) {
+	testCases := []struct {
+		name              string
+		config            *Config
+		mediation         protocol.CredentialMediationRequirement
+		expectedID        string
+		expectedMediation protocol.CredentialMediationRequirement
+	}{
+		{
+			name: "ShouldSucceedConditional",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			mediation:         protocol.MediationConditional,
+			expectedID:        "example.com",
+			expectedMediation: protocol.MediationConditional,
+		},
+		{
+			name: "ShouldSucceedRequired",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			mediation:         protocol.MediationRequired,
+			expectedID:        "example.com",
+			expectedMediation: protocol.MediationRequired,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.config)
+			require.NoError(t, err)
+
+			assertion, session, err := w.BeginDiscoverableMediatedLogin(tc.mediation)
+			require.NoError(t, err)
+			require.NotNil(t, assertion)
+			require.NotNil(t, session)
+			assert.Equal(t, tc.expectedID, assertion.Response.RelyingPartyID)
+			assert.Equal(t, tc.expectedMediation, assertion.Mediation)
+			assert.Empty(t, session.UserID)
+		})
+	}
+}
+
+func TestBeginMediatedLogin_NoCredentials(t *testing.T) {
+	config := &Config{
+		RPID:          "example.com",
+		RPDisplayName: "Test Display Name",
+		RPOrigins:     []string{"https://example.com"},
+	}
+
+	w, err := New(config)
+	require.NoError(t, err)
+
+	user := &defaultUser{
+		id:          []byte("123"),
+		credentials: nil,
+	}
+
+	assertion, session, err := w.BeginMediatedLogin(user, protocol.MediationDefault)
+	assert.Nil(t, assertion)
+	assert.Nil(t, session)
+	assert.EqualError(t, err, "Found no credentials for user")
+}
+
+func TestBeginLogin_Timeouts(t *testing.T) {
+	testCases := []struct {
+		name            string
+		config          *Config
+		opts            []LoginOption
+		expectedTimeout int
+	}{
+		{
+			name: "ShouldUseDefaultTimeout",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+			},
+			expectedTimeout: 300000,
+		},
+		{
+			name: "ShouldUseUVDTimeout",
+			config: &Config{
+				RPID:          "example.com",
+				RPDisplayName: "Test Display Name",
+				RPOrigins:     []string{"https://example.com"},
+				AuthenticatorSelection: protocol.AuthenticatorSelection{
+					UserVerification: protocol.VerificationDiscouraged,
+				},
+			},
+			expectedTimeout: 120000,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(tc.config)
+			require.NoError(t, err)
+
+			user := &defaultUser{
+				credentials: []Credential{{}},
+			}
+
+			assertion, _, err := w.BeginLogin(user, tc.opts...)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expectedTimeout, assertion.Response.Timeout)
+		})
+	}
+}
+
+func TestValidateLogin_Errors(t *testing.T) {
+	testCases := []struct {
+		name    string
+		user    User
+		session SessionData
+		err     string
+	}{
+		{
+			name: "ShouldFailUserIDMismatch",
+			user: &defaultUser{
+				id: []byte("123"),
+			},
+			session: SessionData{
+				UserID: []byte("456"),
+			},
+			err: "ID mismatch for User and Session",
+		},
+		{
+			name: "ShouldFailSessionExpired",
+			user: &defaultUser{
+				id: []byte("123"),
+			},
+			session: SessionData{
+				UserID:  []byte("123"),
+				Expires: time.Now().Add(-time.Hour),
+			},
+			err: "Session has Expired",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &WebAuthn{Config: &Config{
+				RPID:      "example.com",
+				RPOrigins: []string{"https://example.com"},
+			}}
+
+			credential, err := w.ValidateLogin(tc.user, tc.session, nil)
+			assert.Nil(t, credential)
+			assert.EqualError(t, err, tc.err)
+		})
+	}
+}
+
+func TestValidatePasskeyLogin_Errors(t *testing.T) {
+	testCases := []struct {
+		name    string
+		handler DiscoverableUserHandler
+		session SessionData
+		parsed  *protocol.ParsedCredentialAssertionData
+		err     string
+	}{
+		{
+			name: "ShouldFailSessionNotDiscoverable",
+			session: SessionData{
+				UserID: []byte("123"),
+			},
+			err: "Session was not initiated as a client-side discoverable login",
+		},
+		{
+			name: "ShouldFailSessionExpired",
+			session: SessionData{
+				Expires: time.Now().Add(-time.Hour),
+			},
+			err: "Session has Expired",
+		},
+		{
+			name:    "ShouldFailBlankUserHandle",
+			session: SessionData{Challenge: "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k"},
+			parsed: &protocol.ParsedCredentialAssertionData{
+				ParsedPublicKeyCredential: protocol.ParsedPublicKeyCredential{
+					RawID: []byte("cred-id"),
+				},
+				Response: protocol.ParsedAssertionResponse{},
+			},
+			err: "Client-side Discoverable Assertion was attempted with a blank User Handle",
+		},
+		{
+			name: "ShouldFailHandlerError",
+			handler: func(rawID, userHandle []byte) (User, error) {
+				return nil, fmt.Errorf("user not found")
+			},
+			session: SessionData{Challenge: "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k"},
+			parsed: &protocol.ParsedCredentialAssertionData{
+				ParsedPublicKeyCredential: protocol.ParsedPublicKeyCredential{
+					RawID: []byte("cred-id"),
+				},
+				Response: protocol.ParsedAssertionResponse{
+					UserHandle: []byte("user-handle"),
+				},
+			},
+			err: "Failed to lookup Client-side Discoverable Credential: user not found",
+		},
+		{
+			name: "ShouldFailHandlerReturnsNilUser",
+			handler: func(rawID, userHandle []byte) (User, error) {
+				return nil, nil
+			},
+			session: SessionData{Challenge: "E4PTcIH_HfX1pC6Sigk1SC9NAlgeztN0439vi8z_c9k"},
+			parsed: &protocol.ParsedCredentialAssertionData{
+				ParsedPublicKeyCredential: protocol.ParsedPublicKeyCredential{
+					RawID: []byte("cred-id"),
+				},
+				Response: protocol.ParsedAssertionResponse{
+					UserHandle: []byte("user-handle"),
+				},
+			},
+			err: "Failed to lookup Client-side Discoverable Credential: handler returned a nil user",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &WebAuthn{Config: &Config{
+				RPID:      "example.com",
+				RPOrigins: []string{"https://example.com"},
+			}}
+
+			user, credential, err := w.ValidatePasskeyLogin(tc.handler, tc.session, tc.parsed)
+			assert.Nil(t, user)
+			assert.Nil(t, credential)
+			require.EqualError(t, err, tc.err)
+		})
+	}
+}
+
+func TestValidateDiscoverableLogin_Errors(t *testing.T) {
+	w := &WebAuthn{Config: &Config{
+		RPID:      "example.com",
+		RPOrigins: []string{"https://example.com"},
+	}}
+
+	credential, err := w.ValidateDiscoverableLogin(nil, SessionData{UserID: []byte("123")}, nil)
+	assert.Nil(t, credential)
+	require.EqualError(t, err, "Session was not initiated as a client-side discoverable login")
+}
+
+func TestLoginOptions(t *testing.T) {
+	testCases := []struct {
+		name     string
+		opts     []LoginOption
+		have     protocol.PublicKeyCredentialRequestOptions
+		expected protocol.PublicKeyCredentialRequestOptions
+	}{
+		{
+			name: "Empty",
+			opts: nil,
+		},
+		{
+			name: "AllowedCredentials",
+			opts: []LoginOption{WithAllowedCredentials([]protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123")}})},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				AllowedCredentials: []protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123")}},
+			},
+		},
+		{
+			name: "UserVerification",
+			opts: []LoginOption{WithUserVerification(protocol.VerificationRequired)},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				UserVerification: protocol.VerificationRequired,
+			},
+		},
+		{
+			name: "PublicKeyCredentialHints",
+			opts: []LoginOption{WithAssertionPublicKeyCredentialHints([]protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintSecurityKey})},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				Hints: []protocol.PublicKeyCredentialHints{protocol.PublicKeyCredentialHintSecurityKey},
+			},
+		},
+		{
+			name: "Extensions",
+			opts: []LoginOption{WithAssertionExtensions(WithExtensionGetCredBlob())},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				Extensions: protocol.AuthenticationExtensions{GetCredBlob: true},
+			},
+		},
+		{
+			// The option itself no longer inspects the allowed credentials; the appid is discarded by
+			// BeginLogin instead, which TestBeginLoginAppIDPruning covers.
+			name: "AppIDExtensionWithoutU2F",
+			opts: []LoginOption{WithAllowedCredentials([]protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123")}}), WithAppIdExtension("example")},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				AllowedCredentials: []protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, CredentialID: []byte("123")}},
+				Extensions:         protocol.AuthenticationExtensions{AppID: "example"},
+			},
+		},
+		{
+			name: "AppIDExtensionWithU2F",
+			opts: []LoginOption{WithAllowedCredentials([]protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor), CredentialID: []byte("123")}}), WithAppIdExtension("example")},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				AllowedCredentials: []protocol.CredentialDescriptor{{Type: protocol.PublicKeyCredentialType, AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor), CredentialID: []byte("123")}},
+				Extensions:         protocol.AuthenticationExtensions{AppID: "example"},
+			},
+		},
+		{
+			name: "RelyingPartyID",
+			opts: []LoginOption{WithLoginRelyingPartyID("example.com")},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				RelyingPartyID: "example.com",
+			},
+		},
+		{
+			name: "Challenge",
+			opts: []LoginOption{WithChallenge([]byte("00000000000000000000000000000000"))},
+			expected: protocol.PublicKeyCredentialRequestOptions{
+				Challenge: []byte("00000000000000000000000000000000"),
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &tc.have
+
+			for _, opt := range tc.opts {
+				require.NoError(t, opt(opts))
+			}
+
+			assert.Equal(t, tc.expected, *opts)
+		})
+	}
+}
+
+// newTestLoginUser returns a [User] with a single credential. [WebAuthn.BeginLogin] rejects a user with none, so
+// newTestUser cannot be used for an authentication ceremony.
+func newTestLoginUser(t *testing.T) User {
+	t.Helper()
+
+	return &defaultUser{
+		id:          []byte(testUserID),
+		credentials: []Credential{{ID: []byte("credential-id")}},
+	}
+}
+
+func TestBeginLoginAppIDPruning(t *testing.T) {
+	u2f := protocol.CredentialDescriptor{
+		Type:              protocol.PublicKeyCredentialType,
+		CredentialID:      []byte("u2f-credential"),
+		AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor),
+	}
+
+	packed := protocol.CredentialDescriptor{
+		Type:              protocol.PublicKeyCredentialType,
+		CredentialID:      []byte("packed-credential"),
+		AttestationFormat: string(protocol.AttestationFormatPacked),
+	}
+
+	testCases := []struct {
+		name     string
+		allow    []protocol.CredentialDescriptor
+		expected string
+	}{
+		{"U2FPresent", []protocol.CredentialDescriptor{packed, u2f}, "https://example.com"},
+		{"NoU2F", []protocol.CredentialDescriptor{packed}, ""},
+		{"Empty", nil, ""},
+	}
+
+	for _, tc := range testCases {
+		// Both orderings must produce identical results; the option previously read the allowed credentials at the
+		// moment it ran, so listing it first silently did nothing.
+		t.Run(tc.name+"/OptionAfterAllowedCredentials", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			assertion, session, err := w.BeginLogin(newTestLoginUser(t),
+				WithAllowedCredentials(tc.allow),
+				WithAssertionExtensions(WithExtensionAppID("https://example.com")),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, assertion.Response.Extensions.AppID)
+			assert.Equal(t, tc.expected, session.Extensions.AppID)
+		})
+
+		t.Run(tc.name+"/OptionBeforeAllowedCredentials", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			assertion, session, err := w.BeginLogin(newTestLoginUser(t),
+				WithAssertionExtensions(WithExtensionAppID("https://example.com")),
+				WithAllowedCredentials(tc.allow),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, assertion.Response.Extensions.AppID)
+			assert.Equal(t, tc.expected, session.Extensions.AppID)
+		})
+
+		// The deprecated wrapper delegates to the same option and must therefore be pruned identically.
+		t.Run(tc.name+"/DeprecatedWrapperBeforeAllowedCredentials", func(t *testing.T) {
+			w := newTestWebAuthn(t)
+
+			assertion, session, err := w.BeginLogin(newTestLoginUser(t),
+				WithAppIdExtension("https://example.com"),
+				WithAllowedCredentials(tc.allow),
+			)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, assertion.Response.Extensions.AppID)
+			assert.Equal(t, tc.expected, session.Extensions.AppID)
+		})
+	}
+}
+
+func TestBeginDiscoverableLoginAppIDPruning(t *testing.T) {
+	w := newTestWebAuthn(t)
+
+	// A discoverable login has no allowed credentials and so can never carry a FIDO U2F credential.
+	assertion, session, err := w.BeginDiscoverableLogin(WithAssertionExtensions(WithExtensionAppID("https://example.com")))
+
+	require.NoError(t, err)
+	assert.Empty(t, assertion.Response.AllowedCredentials)
+	assert.Empty(t, assertion.Response.Extensions.AppID)
+	assert.Empty(t, session.Extensions.AppID)
+}
+
+func TestBeginLoginAppIDPruningUpdatesRequested(t *testing.T) {
+	w := newTestWebAuthn(t)
+
+	_, session, err := w.BeginLogin(newTestLoginUser(t),
+		WithAllowedCredentials(nil),
+		WithAssertionExtensions(WithExtensionAppID("https://example.com"), WithExtensionGetCredBlob()),
+	)
+
+	require.NoError(t, err)
+	assert.NotContains(t, session.Extensions.Requested, protocol.ExtensionAppID)
+	assert.Contains(t, session.Extensions.Requested, protocol.ExtensionGetCredBlob)
+}
+
+func TestValidateLogin_Full(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	userID := []byte(testUserID)
+
+	t.Run("ShouldSucceedNoAllowedCredentials", func(t *testing.T) {
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+		assert.Equal(t, credentialID, credential.ID)
+		assert.True(t, credential.Flags.UserPresent)
+	})
+
+	t.Run("ShouldSucceedWithAllowedCredentials", func(t *testing.T) {
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:               userID,
+			Challenge:            challenge,
+			AllowedCredentialIDs: [][]byte{credentialID},
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+	})
+
+	t.Run("ShouldFailUserHandleMismatch", func(t *testing.T) {
+		parsedWithUserHandle, _, challengeUH, credIDUH := testLoginSpecVectorNoneES256(t)
+		parsedWithUserHandle.Response.UserHandle = []byte("wrong-user-handle")
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credIDUH,
+					PublicKey: credPubKey,
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challengeUH,
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedWithUserHandle)
+		assert.Nil(t, credential)
+		assert.EqualError(t, err, "User handle and User ID do not match")
+	})
+
+	t.Run("ShouldFailCredentialNotFound", func(t *testing.T) {
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        []byte("different-credential-id"),
+					PublicKey: credPubKey,
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+		assert.Nil(t, credential)
+		assert.EqualError(t, err, "Unable to find the credential for the returned credential ID")
+	})
+
+	t.Run("ShouldFailBackupEligibleFlagMismatch", func(t *testing.T) {
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: false,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+		assert.Nil(t, credential)
+		assert.EqualError(t, err, "Backup Eligible flag inconsistency detected during login validation")
+	})
+
+	t.Run("ShouldFailVerifyError", func(t *testing.T) {
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: []byte("invalid-public-key"),
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+		assert.Nil(t, credential)
+		require.Error(t, err)
+	})
+
+	t.Run("ShouldSucceedWithMDSNilAAGUID", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+
+		provider := mocks.NewMockMetadataProvider(ctrl)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+				MDS:       provider,
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(nil, nil)
+		provider.EXPECT().GetValidateEntryPermitZeroAAGUID(gomock.Any()).Return(true)
+
+		credential, err := w.ValidateLogin(user, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+	})
+
+	t.Run("ShouldFailWithMDSGetEntryError", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+
+		provider := mocks.NewMockMetadataProvider(ctrl)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+				MDS:       provider,
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("entry not found"))
+
+		credential, err := w.ValidateLogin(user, session, parsedResponse)
+		assert.Nil(t, credential)
+		assert.EqualError(t, err, "Failed to validate credential record metadata")
+	})
+
+	t.Run("ShouldSucceedWithMDSAndAAGUID", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+
+		provider := mocks.NewMockMetadataProvider(ctrl)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+				MDS:       provider,
+			},
+		}
+
+		aaguid := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:              credentialID,
+					PublicKey:       credPubKey,
+					AttestationType: "packed",
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+					Authenticator: Authenticator{
+						AAGUID: aaguid,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(nil, nil)
+		provider.EXPECT().GetValidateEntry(gomock.Any()).Return(false)
+
+		credential, err := w.ValidateLogin(user, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+	})
+
+	t.Run("ShouldFailWithMDSInvalidAAGUID", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+
+		provider := mocks.NewMockMetadataProvider(ctrl)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+				MDS:       provider,
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Authenticator: Authenticator{
+						AAGUID: []byte{0x01, 0x02, 0x03},
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		credential, err := w.ValidateLogin(user, session, parsedResponse)
+		assert.Nil(t, credential)
+		assert.EqualError(t, err, "Failed to decode AAGUID")
+	})
+
+	t.Run("ShouldSucceedWithMDSValidateStatusReports", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+
+		provider := mocks.NewMockMetadataProvider(ctrl)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+				MDS:       provider,
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:                credentialID,
+					PublicKey:         credPubKey,
+					AttestationType:   "basic_full",
+					AttestationFormat: "packed",
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			UserID:    userID,
+			Challenge: challenge,
+		}
+
+		provider.EXPECT().GetEntry(gomock.Any(), gomock.Any()).Return(&metadata.Entry{
+			MetadataStatement: metadata.Statement{
+				AttestationTypes: metadata.AuthenticatorAttestationTypes{metadata.BasicFull},
+			},
+		}, nil)
+
+		provider.EXPECT().GetValidateAttestationTypes(gomock.Any()).Return(true)
+		provider.EXPECT().GetValidateStatus(gomock.Any()).Return(true)
+		provider.EXPECT().ValidateStatusReports(gomock.Any(), gomock.Any()).Return(nil)
+		provider.EXPECT().GetValidateTrustAnchor(gomock.Any()).Return(false)
+
+		credential, err := w.ValidateLogin(user, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+	})
+}
+
+func TestValidateLoginRejectsUnsolicitedExtensionOutput(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	parsedResponse.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{
+		AppID: ptr(true),
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	userID := []byte(testUserID)
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				Flags: CredentialFlags{
+					UserPresent:    true,
+					BackupEligible: true,
+				},
+			},
+		},
+	}
+
+	session := SessionData{
+		UserID:     userID,
+		Challenge:  challenge,
+		Extensions: protocol.SessionExtensions{},
+	}
+
+	credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+	assert.Nil(t, credential)
+	assert.ErrorContains(t, err, "appid")
+}
+
+// TestValidateLoginAppIDFromSessionReplacesRPID asserts that an assertion whose authenticator data is scoped to the
+// RP ID is rejected once the session's appid is in play, rather than being accepted because the RP ID hash still
+// matches. The appid used is the one recorded in the session, so the failure is reported against the AppID hash.
+//
+// Specification: §10.1.1. FIDO AppID Extension (https://www.w3.org/TR/webauthn-3/#sctn-appid-extension)
+func TestValidateLoginAppIDFromSessionReplacesRPID(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	parsedResponse.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{
+		AppID: ptr(true),
+	}
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	userID := []byte(testUserID)
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				// GetAppID only resolves the session appid for a credential which came from the legacy FIDO U2F
+				// JavaScript API.
+				AttestationFormat: string(protocol.AttestationFormatFIDOUniversalSecondFactor),
+				Flags: CredentialFlags{
+					UserPresent:    true,
+					BackupEligible: true,
+				},
+			},
+		},
+	}
+
+	session := SessionData{
+		UserID:    userID,
+		Challenge: challenge,
+		Extensions: protocol.SessionExtensions{
+			Requested: []string{protocol.ExtensionAppID},
+			AppID:     "https://appid.example.com",
+		},
+	}
+
+	credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+	assert.Nil(t, credential)
+	require.EqualError(t, err, "Error validating the authenticator response")
+
+	// The expected value is the hash of the session's appid, proving the RP ID hash is no longer accepted as an
+	// alternative once the extension applies.
+	appIDHash := sha256.Sum256([]byte(session.Extensions.AppID))
+
+	var e *protocol.Error
+
+	require.ErrorAs(t, err, &e)
+	assert.Equal(t, fmt.Sprintf("RP Hash mismatch. Expected %x and Received %x", appIDHash, parsedResponse.Response.AuthenticatorData.RPIDHash), e.DevInfo)
+}
+
+func TestValidateLoginLatchesUserVerified(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	require.False(t, parsedResponse.Response.AuthenticatorData.Flags.HasUserVerified())
+	require.True(t, parsedResponse.Response.AuthenticatorData.Flags.HasBackupState())
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	userID := []byte(testUserID)
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				Flags:     NewCredentialFlags(protocol.FlagUserPresent | protocol.FlagUserVerified | protocol.FlagBackupEligible),
+			},
+		},
+	}
+
+	session := SessionData{
+		UserID:    userID,
+		Challenge: challenge,
+	}
+
+	credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+
+	assert.True(t, credential.Flags.UserVerified)
+	assert.True(t, credential.Flags.ProtocolValue().HasUserVerified())
+	assert.True(t, credential.Flags.BackupState)
+}
+
+func TestValidateLoginUsesSessionRelyingPartyID(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.com",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	userID := []byte(testUserID)
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				Flags: CredentialFlags{
+					UserPresent:    true,
+					BackupEligible: true,
+				},
+			},
+		},
+	}
+
+	session := SessionData{
+		UserID:         userID,
+		Challenge:      challenge,
+		RelyingPartyID: "example.org",
+	}
+
+	credential, err := webauthn.ValidateLogin(user, session, parsedResponse)
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+	assert.Equal(t, credentialID, credential.ID)
+}
+
+func TestValidatePasskeyLogin_Full(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	userID := []byte(testUserID)
+	parsedResponse.Response.UserHandle = userID
+
+	t.Run("ShouldSucceed", func(t *testing.T) {
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        credentialID,
+					PublicKey: credPubKey,
+					Flags: CredentialFlags{
+						UserPresent:    true,
+						BackupEligible: true,
+					},
+				},
+			},
+		}
+
+		session := SessionData{
+			Challenge: challenge,
+		}
+
+		handler := func(rawID, userHandle []byte) (User, error) {
+			return user, nil
+		}
+
+		returnedUser, credential, err := w.ValidatePasskeyLogin(handler, session, parsedResponse)
+		require.NoError(t, err)
+		require.NotNil(t, returnedUser)
+		require.NotNil(t, credential)
+		assert.Equal(t, credentialID, credential.ID)
+	})
+
+	t.Run("ShouldFailValidateLoginError", func(t *testing.T) {
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:        []byte("different-id"),
+					PublicKey: credPubKey,
+				},
+			},
+		}
+
+		session := SessionData{
+			Challenge: challenge,
+		}
+
+		handler := func(rawID, userHandle []byte) (User, error) {
+			return user, nil
+		}
+
+		returnedUser, credential, err := w.ValidatePasskeyLogin(handler, session, parsedResponse)
+		assert.Nil(t, returnedUser)
+		assert.Nil(t, credential)
+		require.Error(t, err)
+	})
+}
+
+func TestFinishDiscoverableLogin_Success(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	userID := []byte(testUserID)
+
+	body := map[string]any{
+		"id":    base64.RawURLEncoding.EncodeToString(credentialID),
+		"rawId": base64.RawURLEncoding.EncodeToString(credentialID),
+		"type":  "public-key",
+		"response": map[string]any{
+			"authenticatorData": base64.RawURLEncoding.EncodeToString(parsedResponse.Raw.AssertionResponse.AuthenticatorData),
+			"clientDataJSON":    base64.RawURLEncoding.EncodeToString(parsedResponse.Raw.AssertionResponse.ClientDataJSON),
+			"signature":         base64.RawURLEncoding.EncodeToString(parsedResponse.Response.Signature),
+			"userHandle":        base64.RawURLEncoding.EncodeToString(userID),
+		},
+	}
+
+	data, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				Flags: CredentialFlags{
+					UserPresent:    true,
+					BackupEligible: true,
+				},
+			},
+		},
+	}
+
+	session := SessionData{
+		Challenge: challenge,
+	}
+
+	handler := func(rawID, userHandle []byte) (User, error) {
+		return user, nil
+	}
+
+	reqBody := io.NopCloser(bytes.NewReader(data))
+	httpReq := &http.Request{Body: reqBody}
+
+	credential, err := w.FinishDiscoverableLogin(handler, session, httpReq)
+	require.NoError(t, err)
+	require.NotNil(t, credential)
+	assert.Equal(t, credentialID, credential.ID)
+}
+
+func TestFinishPasskeyLogin_Success(t *testing.T) {
+	parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+	userID := []byte(testUserID)
+
+	body := map[string]any{
+		"id":    base64.RawURLEncoding.EncodeToString(credentialID),
+		"rawId": base64.RawURLEncoding.EncodeToString(credentialID),
+		"type":  "public-key",
+		"response": map[string]any{
+			"authenticatorData": base64.RawURLEncoding.EncodeToString(parsedResponse.Raw.AssertionResponse.AuthenticatorData),
+			"clientDataJSON":    base64.RawURLEncoding.EncodeToString(parsedResponse.Raw.AssertionResponse.ClientDataJSON),
+			"signature":         base64.RawURLEncoding.EncodeToString(parsedResponse.Response.Signature),
+			"userHandle":        base64.RawURLEncoding.EncodeToString(userID),
+		},
+	}
+
+	data, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := &WebAuthn{
+		Config: &Config{
+			RPID:      "example.org",
+			RPOrigins: []string{"https://example.org"},
+		},
+	}
+
+	user := &defaultUser{
+		id: userID,
+		credentials: []Credential{
+			{
+				ID:        credentialID,
+				PublicKey: credPubKey,
+				Flags: CredentialFlags{
+					UserPresent:    true,
+					BackupEligible: true,
+				},
+			},
+		},
+	}
+
+	session := SessionData{
+		Challenge: challenge,
+	}
+
+	handler := func(rawID, userHandle []byte) (User, error) {
+		return user, nil
+	}
+
+	reqBody := io.NopCloser(bytes.NewReader(data))
+	httpReq := &http.Request{Body: reqBody}
+
+	returnedUser, credential, err := w.FinishPasskeyLogin(handler, session, httpReq)
+	require.NoError(t, err)
+	require.NotNil(t, returnedUser)
+	require.NotNil(t, credential)
+	assert.Equal(t, credentialID, credential.ID)
+}
+
+// testLoginSpecVectorNoneES256 returns the spec test vector data for NoneES256 authentication.
+// See: https://www.w3.org/TR/webauthn-3/#sctn-test-vectors-none-es256
+func testLoginSpecVectorNoneES256(t *testing.T) (parsedResponse *protocol.ParsedCredentialAssertionData, credPubKey []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	const (
+		authenticatorDataHex = "bfabc37432958b063360d3ad6461c9c4735ae7f8edd46592a5e0f01452b2e4b51900000000"
+		clientDataJSONHex    = "7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a224f63446e55685158756c5455506f334a5558543049393770767a7a59425039745a63685879617630314167222c226f726967696e223a2268747470733a2f2f6578616d706c652e6f7267222c2263726f73734f726967696e223a66616c73657d"
+		signatureHex         = "3046022100f50a4e2e4409249c4a853ba361282f09841df4dd4547a13a87780218deffcd380221008480ac0f0b93538174f575bf11a1dd5d78c6e486013f937295ea13653e331e87"
+		credentialIDHex      = "f91f391db4c9b2fde0ea70189cba3fb63f579ba6122b33ad94ff3ec330084be4" //nolint:gosec
+		challengeHex         = "39c0e7521417ba54d43e8dc95174f423dee9bf3cd804ff6d65c857c9abf4d408"
+		credentialPubKeyHex  = "a5010203262001215820afefa16f97ca9b2d23eb86ccb64098d20db90856062eb249c33a9b672f26df61225820930a56b87a2fca66334b03458abf879717c12cc68ed73290af2e2664796b9220"
+	)
+
+	credentialID, err := hex.DecodeString(credentialIDHex)
+	require.NoError(t, err)
+
+	credPubKey, err = hex.DecodeString(credentialPubKeyHex)
+	require.NoError(t, err)
+
+	challenge = base64.RawURLEncoding.EncodeToString(testDecodeHex(t, challengeHex))
+
+	id := base64.RawURLEncoding.EncodeToString(credentialID)
+	authenticatorData := base64.RawURLEncoding.EncodeToString(testDecodeHex(t, authenticatorDataHex))
+	clientDataJSON := base64.RawURLEncoding.EncodeToString(testDecodeHex(t, clientDataJSONHex))
+	signature := base64.RawURLEncoding.EncodeToString(testDecodeHex(t, signatureHex))
+
+	body := map[string]any{
+		"id":    id,
+		"rawId": id,
+		"type":  "public-key",
+		"response": map[string]any{
+			"authenticatorData": authenticatorData,
+			"clientDataJSON":    clientDataJSON,
+			"signature":         signature,
+		},
+	}
+
+	data, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	parsedResponse, err = protocol.ParseCredentialRequestResponseBytes(data)
+	require.NoError(t, err)
+
+	return parsedResponse, credPubKey, challenge, credentialID
+}
+
+// TestValidateLoginOpaqueOrigin covers [Config.RPOpaqueOrigins] reaching the assertion verifier. The client data of
+// the vector is signed over, so replacing its origin invalidates the assertion signature; the origin is verified well
+// before the signature is, which is what lets the signature failure stand as proof the origin was accepted.
+func TestValidateLoginOpaqueOrigin(t *testing.T) {
+	const origin = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+
+	testCases := []struct {
+		name            string
+		rpOpaqueOrigins []string
+		err             string
+	}{
+		{
+			name:            "ShouldAcceptAConfiguredOpaqueOrigin",
+			rpOpaqueOrigins: []string{origin},
+			err:             "Error validating the assertion signature: <nil>",
+		},
+		{
+			name: "ShouldRejectAnOpaqueOriginWhichIsNotConfigured",
+			err:  "Error validating origin",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256Origin(t, origin)
+
+			userID := []byte(testUserID)
+
+			w := &WebAuthn{
+				Config: &Config{
+					RPID:            "example.org",
+					RPOrigins:       []string{"https://example.org"},
+					RPOpaqueOrigins: tc.rpOpaqueOrigins,
+				},
+			}
+
+			user := &defaultUser{
+				id: userID,
+				credentials: []Credential{
+					{
+						ID:        credentialID,
+						PublicKey: credPubKey,
+						Flags: CredentialFlags{
+							UserPresent:    true,
+							BackupEligible: true,
+						},
+					},
+				},
+			}
+
+			credential, err := w.ValidateLogin(user, SessionData{Challenge: challenge, UserID: userID}, parsedResponse)
+
+			assert.Nil(t, credential)
+			assert.EqualError(t, err, tc.err)
+		})
+	}
+}
+
+// TestBeginLoginOrigin covers [WithLoginOrigin] recording the bound origin in the session, and the narrowing rule
+// which requires the bound value to be one of the configured [Config.RPOrigins].
+func TestBeginLoginOrigin(t *testing.T) {
+	const opaque = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+
+	testCases := []struct {
+		name            string
+		origin          string
+		rpOpaqueOrigins []string
+		expected        string
+		err             string
+	}{
+		{
+			name:     "ShouldNotBindAnOriginWhenTheOptionIsNotSupplied",
+			expected: "",
+		},
+		{
+			name:     "ShouldBindAConfiguredOrigin",
+			origin:   "https://b.example.com",
+			expected: "https://b.example.com",
+		},
+		{
+			name:   "ShouldRejectAnOriginWhichIsNotConfigured",
+			origin: "https://c.example.com",
+			err:    "error generating assertion: the ceremony origin 'https://c.example.com' must be one of the origins in the 'RPOrigins' configuration",
+		},
+		{
+			name:            "ShouldRejectAnOpaqueOriginEvenWhenItIsConfigured",
+			origin:          opaque,
+			rpOpaqueOrigins: []string{opaque},
+			err:             "error generating assertion: the ceremony origin 'android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk' can't be bound as it's opaque and an opaque origin is only conveyed in the ceremony response",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(&Config{
+				RPID:            "example.com",
+				RPDisplayName:   "Test",
+				RPOrigins:       []string{"https://a.example.com", "https://b.example.com"},
+				RPOpaqueOrigins: tc.rpOpaqueOrigins,
+			})
+			require.NoError(t, err)
+
+			var opts []LoginOption
+
+			if tc.origin != "" {
+				opts = append(opts, WithLoginOrigin(tc.origin))
+			}
+
+			assertion, session, err := w.BeginDiscoverableLogin(opts...)
+
+			if tc.err != "" {
+				assert.Nil(t, assertion)
+				assert.Nil(t, session)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, session)
+			assert.Equal(t, tc.expected, session.Origin)
+		})
+	}
+}
+
+// TestValidateLoginBoundOrigin covers [SessionData.Origin] narrowing the origins the assertion is verified against to
+// the single origin the ceremony was begun with. The opaque case relies on the origin being verified before the
+// signature, so the signature failure the modified client data causes stands as proof the origin was accepted.
+func TestValidateLoginBoundOrigin(t *testing.T) {
+	const (
+		originVector = "https://example.org"
+		originOther  = "https://other.example.org"
+		originOpaque = "android:apk-key-hash:2jmj7l5rSw0yVb-vlWAYkK-YBwk"
+	)
+
+	testCases := []struct {
+		name            string
+		responseOrigin  string
+		sessionOrigin   string
+		rpOpaqueOrigins []string
+		err             string
+	}{
+		{
+			name:          "ShouldAcceptTheBoundOrigin",
+			sessionOrigin: originVector,
+		},
+		{
+			name: "ShouldAcceptAnyConfiguredOriginWhenTheSessionIsNotBound",
+		},
+		{
+			name:          "ShouldRejectAnotherConfiguredOriginWhenTheSessionIsBound",
+			sessionOrigin: originOther,
+			err:           "Error validating origin",
+		},
+		{
+			name:            "ShouldAcceptAConfiguredOpaqueOriginWhileTheSessionIsBound",
+			responseOrigin:  originOpaque,
+			sessionOrigin:   originVector,
+			rpOpaqueOrigins: []string{originOpaque},
+			err:             "Error validating the assertion signature: <nil>",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				parsedResponse *protocol.ParsedCredentialAssertionData
+				credPubKey     []byte
+				challenge      string
+				credentialID   []byte
+			)
+
+			if tc.responseOrigin == "" {
+				parsedResponse, credPubKey, challenge, credentialID = testLoginSpecVectorNoneES256(t)
+			} else {
+				parsedResponse, credPubKey, challenge, credentialID = testLoginSpecVectorNoneES256Origin(t, tc.responseOrigin)
+			}
+
+			userID := []byte(testUserID)
+
+			w := &WebAuthn{
+				Config: &Config{
+					RPID:            "example.org",
+					RPOrigins:       []string{originVector, originOther},
+					RPOpaqueOrigins: tc.rpOpaqueOrigins,
+				},
+			}
+
+			user := &defaultUser{
+				id: userID,
+				credentials: []Credential{
+					{
+						ID:        credentialID,
+						PublicKey: credPubKey,
+						Flags: CredentialFlags{
+							UserPresent:    true,
+							BackupEligible: true,
+						},
+					},
+				},
+			}
+
+			session := SessionData{
+				Challenge: challenge,
+				Origin:    tc.sessionOrigin,
+				UserID:    userID,
+			}
+
+			credential, err := w.ValidateLogin(user, session, parsedResponse)
+
+			if tc.err != "" {
+				assert.Nil(t, credential)
+				assert.EqualError(t, err, tc.err)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, credential)
+			assert.Equal(t, credentialID, credential.ID)
+		})
+	}
+}
+
+// testLoginSpecVectorNoneES256Origin returns the spec test vector data for NoneES256 authentication with the origin
+// of the client data replaced by origin, which invalidates the assertion signature over it.
+func testLoginSpecVectorNoneES256Origin(t *testing.T, origin string) (parsedResponse *protocol.ParsedCredentialAssertionData, credPubKey []byte, challenge string, credentialID []byte) {
+	t.Helper()
+
+	parsedResponse, credPubKey, challenge, credentialID = testLoginSpecVectorNoneES256(t)
+
+	var clientData map[string]any
+
+	require.NoError(t, json.Unmarshal(parsedResponse.Raw.AssertionResponse.ClientDataJSON, &clientData))
+
+	clientData["origin"] = origin
+
+	raw, err := json.Marshal(clientData)
+	require.NoError(t, err)
+
+	body := map[string]any{
+		"id":    base64.RawURLEncoding.EncodeToString(credentialID),
+		"rawId": base64.RawURLEncoding.EncodeToString(credentialID),
+		"type":  "public-key",
+		"response": map[string]any{
+			"authenticatorData": base64.RawURLEncoding.EncodeToString(parsedResponse.Raw.AssertionResponse.AuthenticatorData),
+			"clientDataJSON":    base64.RawURLEncoding.EncodeToString(raw),
+			"signature":         base64.RawURLEncoding.EncodeToString(parsedResponse.Response.Signature),
+		},
+	}
+
+	data, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	parsedResponse, err = protocol.ParseCredentialRequestResponseBytes(data)
+	require.NoError(t, err)
+
+	return parsedResponse, credPubKey, challenge, credentialID
+}
+
+func TestBeginLoginOptionError(t *testing.T) {
+	w, err := New(&Config{RPID: "example.com", RPDisplayName: "Test", RPOrigins: []string{"https://example.com"}})
+	require.NoError(t, err)
+
+	opt := func(pkcro *protocol.PublicKeyCredentialRequestOptions) error {
+		return fmt.Errorf("boom")
+	}
+
+	assertion, session, err := w.BeginDiscoverableLogin(opt)
+
+	assert.Nil(t, assertion)
+	assert.Nil(t, session)
+	assert.EqualError(t, err, "error applying login option: boom")
+}
+
+func testDecodeHex(t *testing.T, s string) []byte {
+	t.Helper()
+
+	data, err := hex.DecodeString(s)
+	require.NoError(t, err)
+
+	return data
+}
+
+func TestValidateLoginExtensionOutputs(t *testing.T) {
+	userID := []byte(testUserID)
+
+	newFixture := func(t *testing.T, attestationFormat string) (*WebAuthn, *defaultUser, SessionData, *protocol.ParsedCredentialAssertionData) {
+		t.Helper()
+
+		parsedResponse, credPubKey, challenge, credentialID := testLoginSpecVectorNoneES256(t)
+
+		w := &WebAuthn{
+			Config: &Config{
+				RPID:      "example.org",
+				RPOrigins: []string{"https://example.org"},
+			},
+		}
+
+		user := &defaultUser{
+			id: userID,
+			credentials: []Credential{
+				{
+					ID:                credentialID,
+					PublicKey:         credPubKey,
+					AttestationFormat: attestationFormat,
+					Flags:             CredentialFlags{UserPresent: true, BackupEligible: true},
+				},
+			},
+		}
+
+		return w, user, SessionData{UserID: userID, Challenge: challenge}, parsedResponse
+	}
+
+	t.Run("AppIDWithoutSessionValue", func(t *testing.T) {
+		// The client says it acted on the FIDO AppID extension for a credential registered through the legacy U2F
+		// API, but the session records no appid, so there is no value to verify the assertion's RP ID against.
+		w, user, session, response := newFixture(t, string(protocol.AttestationFormatFIDOUniversalSecondFactor))
+
+		response.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{AppID: ptr(true)}
+
+		credential, err := w.ValidateLogin(user, session, response)
+
+		assert.Nil(t, credential)
+		assert.ErrorContains(t, err, "appid")
+	})
+
+	t.Run("UnsolicitedOutput", func(t *testing.T) {
+		// The same output against a credential which is not U2F leaves GetAppID with nothing to do, so the
+		// unsolicited check is what rejects it: the session never asked for the extension.
+		w, user, session, response := newFixture(t, string(protocol.AttestationFormatPacked))
+
+		response.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{AppID: ptr(true)}
+
+		credential, err := w.ValidateLogin(user, session, response)
+
+		assert.Nil(t, credential)
+		assert.ErrorContains(t, err, "was not requested")
+	})
+
+	t.Run("SolicitedOutput", func(t *testing.T) {
+		// The discriminating case: the same output passes once the session records that it was asked for.
+		w, user, session, response := newFixture(t, string(protocol.AttestationFormatPacked))
+
+		response.ClientExtensionResults = protocol.AuthenticationExtensionsClientOutputs{AppID: ptr(true)}
+		session.Extensions = protocol.SessionExtensions{Requested: []string{protocol.ExtensionAppID}}
+
+		credential, err := w.ValidateLogin(user, session, response)
+
+		require.NoError(t, err)
+		require.NotNil(t, credential)
+	})
+}
+
+func TestBeginLoginRejectsInvalidConfig(t *testing.T) {
+	// As with registration, the lazily validated configuration must stop the ceremony rather than producing
+	// request options from an incomplete configuration.
+	w := &WebAuthn{Config: &Config{}}
+
+	user := &defaultUser{
+		id:          []byte(testUserID),
+		credentials: []Credential{{ID: []byte("credential")}},
+	}
+
+	assertion, session, err := w.BeginLogin(user)
+
+	assert.Nil(t, assertion)
+	assert.Nil(t, session)
+	assert.ErrorContains(t, err, "error occurred validating the configuration")
+}
+
+func TestFinishLoginFailureSessionChallenge(t *testing.T) {
+	webauthn := &WebAuthn{
+		Config: &Config{
+			RPDisplayName: "test_rp",
+			RPOrigins:     []string{"https://webauthn.io"},
+			RPID:          "webauthn.io",
+		},
+	}
+
+	userHandle := []byte("0ToAAAAAAAAAAA")
+
+	parsed := &protocol.ParsedCredentialAssertionData{
+		Response: protocol.ParsedAssertionResponse{UserHandle: userHandle},
+	}
+
+	testCases := []struct {
+		name      string
+		challenge string
+		info      string
+	}{
+		{"ShouldFailEmpty", "", "The challenge must be at least 16 bytes but it has a length of 0"},
+		{"ShouldFailShort", "d3JvbmctY2hhbGxlbmdl", "The challenge must be at least 16 bytes but it has a length of 15"},
+		{"ShouldFailInvalid", "not base64url!", "The challenge could not be decoded: illegal base64 data at input byte 3"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("ValidateLogin", func(t *testing.T) {
+				user := &defaultUser{id: userHandle}
+
+				_, err := webauthn.ValidateLogin(user, SessionData{UserID: userHandle, Challenge: tc.challenge}, parsed)
+
+				var e *protocol.Error
+
+				require.ErrorAs(t, err, &e)
+				assert.Equal(t, "Session has an invalid challenge", e.Details)
+				assert.Equal(t, tc.info, e.DevInfo)
+			})
+
+			t.Run("ValidatePasskeyLogin", func(t *testing.T) {
+				handler := func(rawID, userHandle []byte) (User, error) {
+					t.Fatal("the handler must not be called for a session with an invalid challenge")
+
+					return nil, nil
+				}
+
+				_, _, err := webauthn.ValidatePasskeyLogin(handler, SessionData{Challenge: tc.challenge}, parsed)
+
+				var e *protocol.Error
+
+				require.ErrorAs(t, err, &e)
+				assert.Equal(t, "Session has an invalid challenge", e.Details)
+				assert.Equal(t, tc.info, e.DevInfo)
+			})
+		})
+	}
+}
