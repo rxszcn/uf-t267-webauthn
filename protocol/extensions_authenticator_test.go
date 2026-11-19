@@ -1,7 +1,9 @@
 package protocol
 
 import (
+	"maps"
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -51,7 +53,7 @@ func TestAuthenticatorExtensionOutputsVerify(t *testing.T) {
 		{
 			name:     "EnforcedAndHonoured",
 			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationRequired)},
-			session:  SessionExtensions{CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationRequired, EnforceCredentialProtectionPolicy: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredentialProtectionPolicy}, CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationRequired, EnforceCredentialProtectionPolicy: true},
 			ceremony: CreateCeremony,
 		},
 		{
@@ -59,13 +61,13 @@ func TestAuthenticatorExtensionOutputsVerify(t *testing.T) {
 			// default exceeds the request.
 			name:     "EnforcedAndExceeded",
 			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationRequired)},
-			session:  SessionExtensions{CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationOptional, EnforceCredentialProtectionPolicy: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredentialProtectionPolicy}, CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationOptional, EnforceCredentialProtectionPolicy: true},
 			ceremony: CreateCeremony,
 		},
 		{
 			name:     "EnforcedAndDowngraded",
 			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationOptional)},
-			session:  SessionExtensions{CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationRequired, EnforceCredentialProtectionPolicy: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredentialProtectionPolicy}, CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationRequired, EnforceCredentialProtectionPolicy: true},
 			ceremony: CreateCeremony,
 			errs:     []string{"credentialProtectionPolicy", "less restrictive"},
 		},
@@ -87,7 +89,7 @@ func TestAuthenticatorExtensionOutputsVerify(t *testing.T) {
 		{
 			name:     "EnforcedWithUnknownPolicy",
 			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationRequired)},
-			session:  SessionExtensions{CredentialProtectionPolicy: CredentialProtectionPolicy("nonsense"), EnforceCredentialProtectionPolicy: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredentialProtectionPolicy}, CredentialProtectionPolicy: CredentialProtectionPolicy("nonsense"), EnforceCredentialProtectionPolicy: true},
 			ceremony: CreateCeremony,
 			errs:     []string{"credentialProtectionPolicy", "not a known policy"},
 		},
@@ -109,20 +111,20 @@ func TestAuthenticatorExtensionOutputsVerify(t *testing.T) {
 		{
 			name:     "CredBlobStored",
 			outputs:  &AuthenticatorExtensionOutputs{CredBlobSet: ptr(true)},
-			session:  SessionExtensions{CredBlob: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredBlob}, CredBlob: true},
 			ceremony: CreateCeremony,
 		},
 		{
 			name:     "CredBlobNotStored",
 			outputs:  &AuthenticatorExtensionOutputs{CredBlobSet: ptr(false)},
-			session:  SessionExtensions{CredBlob: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredBlob}, CredBlob: true},
 			ceremony: CreateCeremony,
 			errs:     []string{"credBlob", "was not stored"},
 		},
 		{
 			name:     "CredBlobOutcomeMissing",
 			outputs:  &AuthenticatorExtensionOutputs{},
-			session:  SessionExtensions{CredBlob: true},
+			session:  SessionExtensions{Requested: []string{ExtensionCredBlob}, CredBlob: true},
 			ceremony: CreateCeremony,
 			errs:     []string{"credBlob", "did not report whether it was stored"},
 		},
@@ -151,7 +153,7 @@ func TestAuthenticatorExtensionOutputsVerify(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.outputs.Verify(tc.session, tc.ceremony)
+			err := tc.outputs.Verify(tc.session, tc.ceremony, UnsolicitedOutputPolicyReject)
 
 			if len(tc.errs) == 0 {
 				assert.NoError(t, err)
@@ -391,4 +393,208 @@ func TestParseAuthenticatorExtensionOutputsMalformed(t *testing.T) {
 	_, err := ParseAuthenticatorExtensionOutputs([]byte{0xff, 0xff, 0xff})
 
 	assert.Error(t, err)
+}
+
+// TestAuthenticatorExtensionOutputsVerifyUnsolicited covers the four-arm matrix of §7.1 step 17 on the authenticator
+// side: an unrequested modelled identifier, an unrequested vendor identifier, an unrequested output under the ignore
+// policy, and a requested output whose identifier is spelled differently from the input which solicited it. The
+// first two arms are the split behaviour this rule closes: they were accepted end to end, and what they carried
+// reached [NewCredential]'s credential record, while the client half rejected the same identifier.
+//
+// The requested arms are constructed through [AuthenticationExtensions.Session] wherever the wiring between input and
+// output identifiers is what is under test, so a change to that mapping fails here rather than only in an end-to-end
+// test that would be slower to localise.
+func TestAuthenticatorExtensionOutputsVerifyUnsolicited(t *testing.T) {
+	testCases := []struct {
+		name     string
+		outputs  *AuthenticatorExtensionOutputs
+		session  SessionExtensions
+		ceremony CeremonyType
+		policy   UnsolicitedOutputPolicy
+		errs     []string
+	}{
+		{
+			// Arm 1: a modelled identifier the Relying Party never requested.
+			name:     "UnrequestedModelled",
+			outputs:  &AuthenticatorExtensionOutputs{MinPinLength: ptr(uint(6))},
+			ceremony: CreateCeremony,
+			errs:     []string{"minPinLength", "was not requested"},
+		},
+		{
+			// Arm 2: a vendor identifier this library does not model, preserved in Extra by the parser. It is
+			// present through Extra rather than a typed field and must be rejected on equal terms.
+			name:     "UnrequestedVendor",
+			outputs:  &AuthenticatorExtensionOutputs{Extra: map[string]any{"vendorThing": "x"}},
+			ceremony: CreateCeremony,
+			errs:     []string{"vendorThing", "was not requested"},
+		},
+		{
+			// Arm 3: the ignore policy admits an unrequested output on this half exactly as it does on the client
+			// half, so a deployment which relaxed the policy for a chatty client does not trip over its authenticator.
+			name:     "UnrequestedIgnored",
+			outputs:  &AuthenticatorExtensionOutputs{Extra: map[string]any{"vendorThing": "x"}},
+			ceremony: CreateCeremony,
+			policy:   UnsolicitedOutputPolicyIgnore,
+		},
+		{
+			// Arm 3, modelled variant: the relaxed policy must not be selective between the two identifier kinds.
+			name:     "UnrequestedModelledIgnored",
+			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationOptional)},
+			ceremony: CreateCeremony,
+			policy:   UnsolicitedOutputPolicyIgnore,
+		},
+		{
+			// Arm 4: the requested output continues to pass. The output identifier is the authenticator's own
+			// 'credProtect', which the requested list records under the client input name.
+			name:     "RequestedOutputPasses",
+			outputs:  &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationRequired)},
+			session:  AuthenticationExtensions{CredentialProtectionPolicy: CredentialProtectionPolicyUserVerificationRequired}.Session(),
+			ceremony: CreateCeremony,
+		},
+		{
+			// Arm 4, vendor variant: a vendor identifier is solicited by requesting the same identifier, which is
+			// the only way the library can know an unmodelled output corresponds to an unmodelled input.
+			name:     "RequestedVendorOutputPasses",
+			outputs:  &AuthenticatorExtensionOutputs{Extra: map[string]any{"vendorThing": "x"}},
+			session:  AuthenticationExtensions{Extra: map[string]any{"vendorThing": map[string]any{"ask": true}}}.Session(),
+			ceremony: CreateCeremony,
+		},
+		{
+			// Both identifiers of a modelled output are checked, and both are reported, rather than the first
+			// problem hiding the second or a map's iteration order deciding which one is reported.
+			name: "EveryUnrequestedOutputIsReported",
+			outputs: &AuthenticatorExtensionOutputs{
+				MinPinLength: ptr(uint(6)),
+				Extra:        map[string]any{"vendorThing": "x"},
+			},
+			ceremony: CreateCeremony,
+			errs:     []string{"minPinLength", "vendorThing"},
+		},
+		{
+			// A typed field which arrived with an unexpected type lives in Extra; it is the same identifier and
+			// must be judged the same way, so a wrong type is not a loophole around the unsolicited check.
+			name:     "UnrequestedWrongTypedModelled",
+			outputs:  &AuthenticatorExtensionOutputs{Extra: map[string]any{ExtensionCredProtect: "three"}},
+			ceremony: CreateCeremony,
+			errs:     []string{"credProtect", "was not requested"},
+		},
+		{
+			// The assertion path's handling of authenticator extension outputs is deliberately unchanged: §7.2 has
+			// no equivalent obligation, and the ceremony has no registration extension to assert. This arm pins
+			// that the new registration check did not leak into it.
+			name:     "AssertionIsUnaffected",
+			outputs:  &AuthenticatorExtensionOutputs{Extra: map[string]any{"vendorThing": "x"}},
+			ceremony: AssertCeremony,
+			errs:     []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.outputs.Verify(tc.session, tc.ceremony, tc.policy)
+
+			if len(tc.errs) == 0 {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			for _, fragment := range tc.errs {
+				assert.ErrorContains(t, err, fragment)
+			}
+		})
+	}
+}
+
+// TestAuthenticatorExtensionOutputsVerifyUnsolicitedOutputNamesIdentifier pins that the rejection names the
+// identifier the authenticator actually returned, not the input which would have solicited it. An operator reading
+// the error has to correlate it with the signed authenticator data, where the abbreviated identifier appears.
+func TestAuthenticatorExtensionOutputsVerifyUnsolicitedOutputNamesIdentifier(t *testing.T) {
+	outputs := &AuthenticatorExtensionOutputs{CredProtect: ptr(CredentialProtectionPolicyUserVerificationOptional)}
+
+	err := outputs.Verify(SessionExtensions{}, CreateCeremony, UnsolicitedOutputPolicyReject)
+	require.Error(t, err)
+
+	var protocolError *Error
+
+	require.ErrorAs(t, err, &protocolError)
+	assert.Equal(t, ErrBadRequest.Type, protocolError.Type)
+	assert.Contains(t, protocolError.Details, `"credProtect"`)
+
+	// The client half's wording is the counterpart, so a caller can distinguish which channel rejected when both
+	// are checked in one ceremony.
+	assert.Contains(t, protocolError.Details, "authenticator returned")
+}
+
+// TestAuthenticatorExtensionOutputsSolicitedByClientInputs covers the identifier mapping in both directions: every
+// modelled authenticator output identifier is solicited by the client input(s) it answers, and no modelled output
+// identifier is mapped to itself, which would be a silent no-op for an authenticator whose input name differs.
+func TestAuthenticatorExtensionOutputsSolicitedByClientInputs(t *testing.T) {
+	// The mapping must cover every modelled output identifier so the requested list can never cover one while the
+	// check looks for the other.
+	assert.ElementsMatch(t, []string{
+		ExtensionCredProtect, ExtensionMinPinLength, ExtensionCredBlob, ExtensionHMACSecret, ExtensionUVM,
+	}, slices.Sorted(maps.Keys(extensionAuthenticatorOutputInputs)))
+
+	for output, inputs := range extensionAuthenticatorOutputInputs {
+		for _, input := range inputs {
+			assert.True(t, authenticatorOutputSolicited(SessionExtensions{Requested: []string{input}}, output),
+				"requesting %q must solicit %q", input, output)
+		}
+	}
+
+	// An identifier this library does not model is solicited only by the same identifier, and an unrequested one is
+	// not solicited at all.
+	assert.True(t, authenticatorOutputSolicited(SessionExtensions{Requested: []string{"vendorThing"}}, "vendorThing"))
+	assert.False(t, authenticatorOutputSolicited(SessionExtensions{Requested: []string{"otherThing"}}, "vendorThing"))
+	assert.False(t, authenticatorOutputSolicited(SessionExtensions{}, ExtensionCredProtect))
+}
+
+// TestAuthenticatorExtensionOutputsVerifyMatchesClientHalf compares the two halves of the same policy: for the same
+// unrequested identifier and the same policy value, both channels must agree on whether the ceremony fails. The
+// split this test pins was that the client half rejected while the authenticator half accepted, so a regression in
+// either direction shows up as an asymmetry rather than only as a single failing arm.
+func TestAuthenticatorExtensionOutputsVerifyMatchesClientHalf(t *testing.T) {
+	// credProtect is modelled on the authenticator half; credProps is the client half's analogue. Both are
+	// registration extensions which the session can record as requested.
+	testCases := []struct {
+		name      string
+		session   SessionExtensions
+		policy    UnsolicitedOutputPolicy
+		wantError bool
+	}{
+		{
+			name:      "NeitherRequestedRejectPolicy",
+			policy:    UnsolicitedOutputPolicyReject,
+			wantError: true,
+		},
+		{
+			name:      "NeitherRequestedIgnorePolicy",
+			policy:    UnsolicitedOutputPolicyIgnore,
+			wantError: false,
+		},
+		{
+			// Requesting the client input identifier solicits both the client output and the authenticator output
+			// the input maps to, so neither half reports it.
+			name:      "BothRequestedRejectPolicy",
+			session:   SessionExtensions{Requested: []string{ExtensionCredProps, ExtensionCredentialProtectionPolicy}},
+			policy:    UnsolicitedOutputPolicyReject,
+			wantError: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientErr := (AuthenticationExtensionsClientOutputs{
+				CredProps: &CredentialPropertiesOutput{RK: ptr(true)},
+			}).Verify(tc.session, CreateCeremony, tc.policy)
+
+			authenticatorErr := (&AuthenticatorExtensionOutputs{
+				CredProtect: ptr(CredentialProtectionPolicyUserVerificationOptional),
+			}).Verify(tc.session, CreateCeremony, tc.policy)
+
+			assert.Equal(t, tc.wantError, clientErr != nil, "client half")
+			assert.Equal(t, tc.wantError, authenticatorErr != nil, "authenticator half")
+		})
+	}
 }

@@ -145,11 +145,16 @@ type Config struct {
 	// policy on the authenticators that are available to be registered with the Relying Party.
 	Filtering *FilteringConfig
 
-	// ExtensionsUnsolicitedOutputPolicy determines how a client extension output that was not requested by this
-	// Relying Party is handled during the finish step of a ceremony. The zero value
+	// ExtensionsUnsolicitedOutputPolicy determines how an extension output that was not requested by this Relying
+	// Party is handled during the finish step of a ceremony. The zero value
 	// ([protocol.UnsolicitedOutputPolicyReject]) fails the ceremony, which is the recommended setting. Set
-	// [protocol.UnsolicitedOutputPolicyIgnore] only if a client in your deployment is known to return extension
-	// outputs unprompted.
+	// [protocol.UnsolicitedOutputPolicyIgnore] only if a client or authenticator in your deployment is known to
+	// return extension outputs unprompted.
+	//
+	// The policy governs both halves of a registration ceremony: the client extension outputs, and the authenticator
+	// extension outputs decoded from the signed authenticator data. The authenticator half has no outputs to check
+	// during an authentication ceremony. A rejected output names the extension identifier it carried, whether it is
+	// one this library models or a vendor extension preserved verbatim.
 	//
 	// A Relying Party which reconstructs [SessionData] by hand, rather than persisting the value returned by the
 	// Begin* functions verbatim, will lose the record of which extensions were requested and see legitimate

@@ -75,15 +75,17 @@
 //
 // The subset of the inputs required to verify the responses is recorded in [SessionData], specifically its
 // [protocol.SessionExtensions] member. This includes the list of extension identifiers that were requested: by
-// default a client extension output the relying party did not request fails the ceremony, so a relying party
+// default an extension output the relying party did not request fails the ceremony, so a relying party
 // which reconstructs [SessionData] by hand rather than persisting the value returned by the Begin functions
 // verbatim will see legitimate outputs rejected. See [Config.ExtensionsUnsolicitedOutputPolicy] to relax this.
 //
-// That check covers client extension outputs ([protocol.AuthenticationExtensionsClientOutputs]) only. Authenticator
-// extension outputs decoded from the authenticator data ([protocol.AuthenticatorData.Ext]) are never checked
-// against what was requested, deliberately: CTAP authenticators routinely return credProtect unsolicited because
-// they apply a default protection policy of their own, and rejecting an unsolicited authenticator output would
-// fail otherwise-conforming hardware rather than a misbehaving client.
+// The check applies to both extension output channels of a registration: the client extension outputs
+// ([protocol.AuthenticationExtensionsClientOutputs]) and the authenticator extension outputs decoded from the
+// authenticator data ([protocol.AuthenticatorData.Ext]). Each half is checked against the same requested list, and
+// the authenticator half matches an output identifier against the client input identifier which solicits it, so a
+// 'credProtect' output is covered by a 'credentialProtectionPolicy' request. See
+// [Config.ExtensionsUnsolicitedOutputPolicy] to relax the check for both halves; an authentication ceremony has no
+// authenticator extension outputs to check, so the policy only affects its client half.
 //
 // Extension results which remain meaningful for the life of a credential, such as whether it is discoverable, are
 // recorded on [Credential.Extensions] and should be persisted with it. Pseudo-random function results are secrets

@@ -3,7 +3,9 @@ package protocol
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/go-webauthn/webauthn/protocol/webauthncbor"
@@ -128,6 +130,72 @@ func ParseAuthenticatorExtensionOutputs(data []byte) (out *AuthenticatorExtensio
 	return out, nil
 }
 
+// extensionAuthenticatorOutputInputs maps an authenticator extension output identifier to the client extension input
+// identifiers which solicit it. The two namespaces are not the same: an authenticator echoes its own abbreviated
+// identifier, so 'credProtect' answers a 'credentialProtectionPolicy' input and 'hmac-secret' answers
+// 'hmacCreateSecret' or 'hmacGetSecret'. Without this mapping the persisted requested list would reject a legitimate
+// authenticator output merely because the input identifier the Relying Party wrote is spelt differently.
+//
+// An identifier absent from this map is solicited only by a requested input of the same name, which is the best
+// available rule for an extension this library does not model: nothing here knows the mapping its vendor uses.
+var extensionAuthenticatorOutputInputs = map[string][]string{
+	ExtensionCredProtect:  {ExtensionCredentialProtectionPolicy, ExtensionEnforceCredentialProtectionPolicy},
+	ExtensionMinPinLength: {ExtensionMinPinLength},
+	ExtensionCredBlob:     {ExtensionCredBlob, ExtensionGetCredBlob},
+	ExtensionHMACSecret:   {ExtensionHMACCreateSecret, ExtensionHMACGetSecret},
+	ExtensionUVM:          {ExtensionUVM},
+}
+
+// Present returns the extension identifiers present in these authenticator extension outputs, in specification order
+// followed by the sorted [AuthenticatorExtensionOutputs.Extra] keys.
+//
+// A modelled extension whose value arrived with an unexpected type is present through Extra rather than through its
+// typed field, which is consistent with how the parser preserves it.
+func (o *AuthenticatorExtensionOutputs) Present() (names []string) {
+	if o == nil {
+		return nil
+	}
+
+	for _, present := range []struct {
+		name string
+		set  bool
+	}{
+		{ExtensionCredProtect, o.CredProtect != nil},
+		{ExtensionMinPinLength, o.MinPinLength != nil},
+		{ExtensionCredBlob, o.CredBlobSet != nil || o.CredBlob != nil},
+		{ExtensionHMACSecret, o.HMACSecret != nil || o.HMACSecretOutput != nil},
+		{ExtensionUVM, o.UVM != nil},
+	} {
+		if present.set {
+			names = append(names, present.name)
+		}
+	}
+
+	return append(names, slices.Sorted(maps.Keys(o.Extra))...)
+}
+
+// authenticatorOutputSolicited reports whether the authenticator extension output name was requested by the Relying
+// Party, as recorded in the session's requested list.
+//
+// The lookup goes in both directions because the two namespaces do not coincide: a modelled output identifier is
+// matched against the client extension input identifiers which solicit it (see
+// [extensionAuthenticatorOutputInputs]), and an identifier this library does not model is matched against a requested
+// input of the same name. The latter is the only rule available for a vendor extension: nothing here knows which input
+// its authenticator output answers.
+func authenticatorOutputSolicited(session SessionExtensions, name string) bool {
+	if inputs, ok := extensionAuthenticatorOutputInputs[name]; ok {
+		for _, input := range inputs {
+			if slices.Contains(session.Requested, input) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return slices.Contains(session.Requested, name)
+}
+
 // extra records an extension output which was not assigned to a modelled field, allocating the map on first use.
 func (o *AuthenticatorExtensionOutputs) extra(key string, value any) {
 	if o.Extra == nil {
@@ -142,15 +210,22 @@ func (o *AuthenticatorExtensionOutputs) extra(key string, value any) {
 // A nil receiver is valid and means the authenticator returned no extension outputs at all, which is itself a
 // failure when a credential protection policy was requested with enforcement.
 //
-// Two rules are enforced, both of which apply only to registration. The credProtect policy must be honoured when
-// enforcement was requested, and a blob submitted for storage with the credential must actually have been stored.
-// Every problem found is reported rather than only the first, matching
-// [AuthenticationExtensionsClientOutputs.Verify].
+// Three rules are enforced, all of which apply only to registration. Every present output must correspond to an
+// extension the Relying Party requested, exactly as [AuthenticationExtensionsClientOutputs.Verify] requires of the
+// client half; the credProtect policy must be honoured when enforcement was requested; and a blob submitted for
+// storage with the credential must actually have been stored. Every problem found is reported rather than only the
+// first, matching [AuthenticationExtensionsClientOutputs.Verify].
 //
-// CTAP requires the client to fail the ceremony when 'enforceCredentialProtectionPolicy' is set and the
-// authenticator cannot honour the requested policy, but the Relying Party is the only party that can confirm this
-// independently, and unlike the client extension outputs the authenticator data is signed, so the values checked
-// here are covered by the attestation signature.
+// The unsolicited-output rule is the same §7.1 step 17 obligation the client half enforces. The authenticator data's
+// extension outputs are covered by the attestation signature, so they are the stronger of the two channels to check,
+// and an output accepted here is what [NewCredential] records on the credential, which is why a policy the Relying
+// Party never approved must not slip through this half while the client half rejects the same identifier. The rule
+// covers both modelled identifiers resolved to a typed field and unmodelled ones preserved in
+// [AuthenticatorExtensionOutputs.Extra]: a vendor extension this library does not know about was equally not requested.
+//
+// Which requested input solicits an output is resolved by [authenticatorOutputSolicited], because the two namespaces
+// are not spelled alike, and the session's requested list is the same one the client half uses, so a session persisted
+// between the begin and finish steps needs no new field for this check.
 //
 // The applied policy is compared as at-least-as-strict rather than equal, because an authenticator is permitted to
 // apply a stricter policy than the one requested, for instance where its own default exceeds the request.
@@ -160,13 +235,24 @@ func (o *AuthenticatorExtensionOutputs) extra(key string, value any) {
 // assertions.
 //
 // Registry: https://www.iana.org/assignments/webauthn/webauthn.xhtml
-func (o *AuthenticatorExtensionOutputs) Verify(session SessionExtensions, ceremony CeremonyType) error {
-	// Both rules cover registration extensions, so there is nothing to assert for an assertion ceremony.
+func (o *AuthenticatorExtensionOutputs) Verify(session SessionExtensions, ceremony CeremonyType, policy UnsolicitedOutputPolicy) error {
+	// Every rule below is a registration obligation, as is the unsolicited-output check above, so an assertion
+	// ceremony has nothing here to assert.
 	if ceremony == AssertCeremony {
 		return nil
 	}
 
 	var errs []error
+
+	// The guard mirrors [AuthenticationExtensionsClientOutputs.Verify]: the reject policy is the zero value, so an
+	// unexpected policy value rejects rather than admits.
+	if policy != UnsolicitedOutputPolicyIgnore {
+		for _, name := range o.Present() {
+			if !authenticatorOutputSolicited(session, name) {
+				errs = append(errs, ErrBadRequest.WithDetails(fmt.Sprintf("The authenticator returned the %q extension output which was not requested", name)))
+			}
+		}
+	}
 
 	if err := o.verifyCredentialProtectionPolicy(session); err != nil {
 		errs = append(errs, err)

@@ -88,17 +88,23 @@ func (e AuthenticationExtensions) Session() SessionExtensions {
 	}
 }
 
-// UnsolicitedOutputPolicy determines how a client extension output that the Relying Party did not request is
-// handled during the finish step of a ceremony.
+// UnsolicitedOutputPolicy determines how an extension output that the Relying Party did not request is handled
+// during the finish step of a ceremony.
+//
+// It applies to both output channels of a registration ceremony: the client extension outputs checked by
+// [AuthenticationExtensionsClientOutputs.Verify], and the authenticator extension outputs decoded from the signed
+// authenticator data and checked by [AuthenticatorExtensionOutputs.Verify]. An authentication ceremony carries no
+// authenticator extension output, so only the client half applies there.
 type UnsolicitedOutputPolicy int
 
 const (
-	// UnsolicitedOutputPolicyReject fails the ceremony when the client returns an extension output the Relying
-	// Party did not request. This is the zero value and therefore the default.
+	// UnsolicitedOutputPolicyReject fails the ceremony when the client or authenticator returns an extension output
+	// the Relying Party did not request. This is the zero value and therefore the default.
 	UnsolicitedOutputPolicyReject UnsolicitedOutputPolicy = iota
 
-	// UnsolicitedOutputPolicyIgnore accepts and ignores extension outputs the Relying Party did not request. Use
-	// this only when a client is known to return outputs unprompted.
+	// UnsolicitedOutputPolicyIgnore accepts and ignores extension outputs the Relying Party did not request, on
+	// both the client and the authenticator channel. Use this only when a client or authenticator is known to return
+	// outputs unprompted.
 	UnsolicitedOutputPolicyIgnore
 )
 

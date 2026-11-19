@@ -237,10 +237,19 @@ func TestMLDSACeremoniesEndToEnd(t *testing.T) {
 
 // mldsaRegistrationCeremony returns everything the registration half of a vector's ceremony needs, configured for
 // the Relying Party the response was captured against.
+//
+// The captured authenticator applies a credential protection policy of its own and echoes 'credProtect' without the
+// Relying Party having asked for one, which is the CTAP default behaviour the unsolicited-output policy exists to
+// accommodate. The vector is the authenticator's real, signed output and is not altered here, so the ceremony is run
+// under [protocol.UnsolicitedOutputPolicyIgnore] rather than inventing a request the captured session never made.
 func mldsaRegistrationCeremony(t *testing.T, vector mldsaRegistrationVector) (w *WebAuthn, user User, session SessionData, response *protocol.ParsedCredentialCreationData) {
 	t.Helper()
 
-	w = &WebAuthn{Config: &Config{RPID: testMLDSARPID, RPOrigins: []string{testMLDSAOrigin}}}
+	w = &WebAuthn{Config: &Config{
+		RPID:                              testMLDSARPID,
+		RPOrigins:                         []string{testMLDSAOrigin},
+		ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore,
+	}}
 
 	userID := []byte(testMLDSAUserHandle)
 

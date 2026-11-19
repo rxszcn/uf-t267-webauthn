@@ -218,7 +218,7 @@ func (webauthn *WebAuthn) CreateCredential(user User, session SessionData, parse
 		return nil, err
 	}
 
-	if err = parsedResponse.Response.AttestationObject.AuthData.Ext.Verify(session.Extensions, protocol.CreateCeremony); err != nil {
+	if err = parsedResponse.Response.AttestationObject.AuthData.Ext.Verify(session.Extensions, protocol.CreateCeremony, webauthn.Config.ExtensionsUnsolicitedOutputPolicy); err != nil {
 		return nil, err
 	}
 

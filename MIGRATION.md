@@ -521,12 +521,20 @@ carrying no origin behaves exactly as before, so this is opt-in.
 
 ### 2.4 Unrequested extension outputs fail the ceremony by default
 
-The finish step now checks that every client extension output it received corresponds to an extension this Relying
+The finish step now checks that every extension output it received corresponds to an extension this Relying
 Party actually requested, and fails the ceremony otherwise. This is the zero value of the new
 `Config.ExtensionsUnsolicitedOutputPolicy` field, and is the recommended setting.
 
-If a client in your deployment is known to return outputs unprompted, and you would rather not fail a ceremony
-over it:
+The check covers both output channels of a registration ceremony: the client extension outputs, and the
+authenticator extension outputs carried in the signed authenticator data. On the authenticator side an output
+identifier is matched against the client input identifier which solicits it, so a `credProtect` output is covered
+by a `credentialProtectionPolicy` request, and a vendor extension is covered by a requested input of the same name.
+An authentication ceremony carries no authenticator extension output, so the policy only affects its client half.
+A rejected authenticator output names the identifier the authenticator returned, whether or not this library models
+it.
+
+If a client or authenticator in your deployment is known to return outputs unprompted, and you would rather not
+fail a ceremony over it:
 
 ```go
 config := &webauthn.Config{
@@ -534,6 +542,10 @@ config := &webauthn.Config{
 	ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore,
 }
 ```
+
+This is the setting CTAP authenticators which apply a default credential protection policy of their own will need:
+they echo `credProtect` whether or not one was requested, and under the default policy a registration against one
+now fails rather than recording a policy the Relying Party never asked for.
 
 Note this interacts with [§1.1](#11-extension-inputs-and-outputs-are-typed): the check is against what the session
 records as requested, so an extension you request through `WithExtension` for a name this library does not model
@@ -662,9 +674,9 @@ holding the raw inputs to `exts` holding the session subset.
 
 A session serialized by v0.17.x and finished by v0.18.0 will not carry a `requested` list. Under the default
 unsolicited-output policy of [§2.4](#24-unrequested-extension-outputs-fail-the-ceremony-by-default), such a
-ceremony fails if the client returns any client extension output, because nothing in the restored session
-identifies that output as requested. A ceremony whose client returns no extension output is unaffected, whether or
-not it asked for one.
+ceremony fails if the response carries any extension output, from either the client or the authenticator, because
+nothing in the restored session identifies that output as requested. A ceremony whose response carries no extension
+output is unaffected, whether or not it asked for one.
 
 The `appid` value path is separate and survives the upgrade: `SessionExtensions.AppID` uses the same `appid` JSON
 key the old inputs map did, so `GetAppID` still resolves. It is the `requested` list, which the old shape has no
@@ -673,7 +685,9 @@ counterpart for, that is missing.
 Drain or invalidate in-flight sessions as part of the upgrade. Ceremony sessions are short-lived by design, so
 in practice this means deploying during a quiet period, or briefly setting
 `ExtensionsUnsolicitedOutputPolicy: protocol.UnsolicitedOutputPolicyIgnore` across the rollout and removing it
-afterwards. Sessions which requested no extensions are unaffected.
+afterwards. Sessions which requested no extensions are unaffected, except that an authenticator which echoes
+`credProtect` on its own is still rejected under the default policy; see
+[§2.4](#24-unrequested-extension-outputs-fail-the-ceremony-by-default).
 
 ### 3.3 Carried over from v0.17.0
 
